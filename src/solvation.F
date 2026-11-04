@@ -12,24 +12,51 @@
 !WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 !See the License for the specific language governing permissions and
 !limitations under the License.
+!
+! Modifications (VASPsol-openacc, 2026), also under the Apache License 2.0:
+!  - OpenACC offload of the solvation grid work for VASP 6.5 GPU builds
+!    (-DACC_OFFLOAD). In CPU builds every directive is inactive and the
+!    original VASPsol code path is used.
+!  - Global sums use M_sum_d (available in VASP >= 6.4.2) instead of M_sum_s.
+!  - GPU builds call the Fortran intrinsic ERFC (device-callable) instead
+!    of the C-interop ERRFC.
 !**********************************************************************
 
 #include "symbol.inc"
+
+!----------------------------------------------------------------------
+! OpenACC port of VASPsol for VASP 6.5.1 ACC_OFFLOAD builds.
+!
+! All grid work arrays live on the device. Host copies are made only for
+! scalar reductions, the vacuum-level search (GET_VAC_LEVEL) and file
+! output (WRITE_TO_FILE). Every directive carries IF(OFFLOAD_ON), so the
+! code also runs unchanged when offloading is switched off at run time,
+! and in CPU builds all directives are inactive.
+!
+! The complementary error function must be callable from device code:
+! GPU builds use the Fortran intrinsic ERFC instead of the C-interop ERRFC.
+!----------------------------------------------------------------------
+#ifdef _OPENACC
+#define SOL_ERFC ERFC
+#else
+#define SOL_ERFC ERRFC
+#endif
 
 
 MODULE POT_LPCM_K
 
  USE prec
- USE constant 
+ USE constant
  USE base
- USE mpimy 
- USE poscar, ONLY : type_info 
- USE lattice, ONLY : latt, DIRKAR 
+ USE mpimy
+ USE poscar, ONLY : type_info
+ USE lattice, ONLY : latt, DIRKAR
  USE mgrid, ONLY : grid_3d
  USE pseudo, ONLY : potcar
 #ifdef sol_compat
  USE c2f_interface, ONLY : ERRFC
 #endif
+GPACC USE moffload_struct_def, ONLY : OFFLOAD_ON, ACC_ASYNC_Q
 
  PUBLIC :: Vcorrection_lpcm, MY_D_PROD, GET_VAC_LEVEL
  PUBLIC :: PACK_R2C, UNPACK_C2R, WRITE_TO_FILE, SimplePoisson
@@ -40,6 +67,8 @@ MODULE POT_LPCM_K
  INTEGER, PRIVATE, SAVE :: PK_counter = 1
  REAL(q), PRIVATE, SAVE :: CHGMIN = 1E-10_q
  COMPLEX(q), PRIVATE, ALLOCATABLE, SAVE :: Sol_phi(:)
+ ! .TRUE. while the device copy of Sol_phi is the valid one
+ LOGICAL, PRIVATE, SAVE :: SOLPHI_ON_DEVICE = .FALSE.
  REAL(q), ALLOCATABLE, PRIVATE, SAVE :: sigma_rc_k(:), CORE_C(:)
  REAL(q), PRIVATE, SAVE :: sigma_nc_k, sigma_k, nc_k, eb_k
  REAL(q), PRIVATE, SAVE :: kappa2b_k, tau, EDIFFSOL
@@ -76,10 +105,10 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
  COMPLEX(q),ALLOCATABLE :: phi_tilda(:),phi(:),Vcav(:)
  COMPLEX(q),INTENT(OUT) :: Vdiel(SP_GRIDC%MPLWV)
  COMPLEX(q),INTENT(IN) :: SP_CHTOT(SP_GRIDC%MPLWV)
- COMPLEX(q),INTENT(IN) :: TOTN(SP_GRIDC%MPLWV),PS_TOTN(SP_GRIDC%MPLWV) 
+ COMPLEX(q),INTENT(IN) :: TOTN(SP_GRIDC%MPLWV),PS_TOTN(SP_GRIDC%MPLWV)
  RGRID,ALLOCATABLE :: SP_d_eps(:), SP_kappa2(:)
  RGRID,ALLOCATABLE :: RWORK(:)
- INTEGER :: I,J, NCGSOL
+ INTEGER :: I,J, NCGSOL, NP
  REAL(q)  :: Atot, Ael, Acav, Ecorr1, Ecorr2, Ecorr_cav
  REAL(q) :: sigma_nc_k1,sigma_k1,nc_k1,eb_k1,kappa2b_k1
  REAL(q) :: tau1,ediffs
@@ -101,16 +130,21 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
  !vacuum level
  ALLOCATE(RHOB(DIMREAL(SP_GRIDC%MPLWV)) )
  ALLOCATE(RHOION(DIMREAL(SP_GRIDC%MPLWV)) )
-      
+!$ACC ENTER DATA CREATE(SP_d_eps,SP_kappa2,phi_tilda,phi,Vcav,RWORK, &
+!$ACC&                  RWORK_PHI,RWORK_CHG,CWORK_K,RHOB,RHOION) __IF_ASYNC__
+
+ ! Sol_phi is kept between calls (initial guess of the CG solver).
+ ! It is zeroed on the host here; MINIMIZE moves it to the device.
  IF (PK_COUNTER == 1)  THEN
    ALLOCATE(Sol_phi(SP_GRIDC%MPLWV))
    Sol_phi = 0._q
+   SOLPHI_ON_DEVICE = .FALSE.
  ENDIF
 
 !---------------------------------------------------------------
 !set values to the parameters
 !---------------------------------------------------------------
- sigma_nc_k = sigma_nc_k1 
+ sigma_nc_k = sigma_nc_k1
  sigma_k =  sigma_k1
  nc_k =  nc_k1
  eb_k =  eb_k1
@@ -127,11 +161,15 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 !---------------------------------------------------------------
  Ecorr1 = 0.0_q
  Ecorr2 = 0.0_q
- phi_tilda = 0._q
- phi = 0._q
- Vdiel = 0._q
- Vcorr = 0._q
- Vcav = 0._q
+ NP = SP_GRIDC%MPLWV
+!$ACC PARALLEL LOOP PRESENT(phi_tilda,phi,Vdiel,Vcorr,Vcav) __IF_ASYNC__
+ DO I=1,NP
+    phi_tilda(I) = 0._q
+    phi(I) = 0._q
+    Vdiel(I) = 0._q
+    Vcorr(I) = 0._q
+    Vcav(I) = 0._q
+ ENDDO
 ! SP_IO = IO
 
 !-------------------------------------------------------------
@@ -143,7 +181,7 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
       & SP_d_eps, SP_kappa2, Vcav, Acav)
 
 !-------------------------------------------------------------
-!Solves the generalized poisson eqn using CG, 
+!Solves the generalized poisson eqn using CG,
 !returns phi_tilda scaled by edeps/cell vol
 !-------------------------------------------------------------
  CALL MINIMIZE(SP_GRIDC, SP_LATT_CUR, SP_P, SP_T_INFO, SP_d_eps,&
@@ -168,7 +206,10 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 !-------------------------------------------------------------
 ! multiply by 0.5*e/permittivity of free space
 !-------------------------------------------------------------
- Vdiel = 0.5 * Vdiel / EDEPS
+!$ACC PARALLEL LOOP PRESENT(Vdiel) __IF_ASYNC__
+ DO I=1,NP
+    Vdiel(I) = 0.5 * Vdiel(I) / EDEPS
+ ENDDO
 
 !-------------------------------------------------------------
 !compute phi, pot due to (n+N) with epsilon=1
@@ -178,28 +219,30 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 
 !---------------------------------------------------------------------
 !compute V_correction,Vcorr
-!the hartree potential difference between the vacuum case and 
+!the hartree potential difference between the vacuum case and
 ! the solvent case
 !---------------------------------------------------------------------
- Vcorr = phi_tilda - phi
-
 !---------------------------------------------------------------------
 !add the cavitation correction
 !! Vcorr = Vcorr + Vcav
-!both Vdiel and Vcav are the derivatives of the free enrgy wrt 
+!both Vdiel and Vcav are the derivatives of the free enrgy wrt
 !n_cavity
 !where n_cavity=n+pseudo core
 !the reason for seperating Vcorr(coulomb) and Vdiel is becasue for the
 !force corrections due Vcorr we need to multiply by the derivative of
-!total charge density with respect to the positions wheras for 
-!Vdiel we need to multiply by the derivativer of the n_cavity wrt 
+!total charge density with respect to the positions wheras for
+!Vdiel we need to multiply by the derivativer of the n_cavity wrt
 !the positions
 !---------------------------------------------------------------------
- Vdiel = Vdiel + Vcav
+!$ACC PARALLEL LOOP PRESENT(Vcorr,phi_tilda,phi,Vdiel,Vcav) __IF_ASYNC__
+ DO I=1,NP
+    Vcorr(I) = phi_tilda(I) - phi(I)
+    Vdiel(I) = Vdiel(I) + Vcav(I)
+ ENDDO
 
 !-------------------------------------------------------------
 !compute the components of E_correction, Ecorr
-!all energies are computed with chargedensities scaled by the 
+!all energies are computed with chargedensities scaled by the
 !lattice volume inorder to be consistent with vasp
 !-------------------------------------------------------------
 !  Ecorr1 = 0.5*phi_tilda*(n+N), where phi_tilda is the CG soln
@@ -225,7 +268,7 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 !Atot = total solavtion energy
 !---------------------------------------------------------------
  Atot = Ael + Acav
- 
+
  333 FORMAT('SOL:',' ',I3,'  ',E12.5,'   ',E12.5,'   ',E12.5,'   ',I3)
 !---------------------------------------------------------------
 ! write to OUTCAR and stdout
@@ -237,7 +280,7 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 
  !rhob = div((epsilon-1)grad phi)
  !phi in rec space
- IF (LRHOB) CALL COMPUTE_RHOB(SP_GRIDC, SP_LATT_CUR, SP_T_INFO, & 
+ IF (LRHOB) CALL COMPUTE_RHOB(SP_GRIDC, SP_LATT_CUR, SP_T_INFO, &
       & SP_D_EPS, PHI_TILDA, RHOB)
 
  !rhion = -kappa^2 * phi, in real space
@@ -245,10 +288,10 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
  !mind: after this the phi will be in real space
  IF (LRHOION) CALL COMPUTE_RHOION(SP_GRIDC, SP_LATT_CUR, SP_T_INFO, &
       & SP_KAPPA2, PHI_TILDA, RHOION)
- 
+
  !vacuum level
  !phi to real space
- CALL FFT3D(phi, SP_GRIDC, 1) 
+ CALL FFT3D(phi, SP_GRIDC, 1)
  CALL UNPACK_C2R(phi, 1.0_q, phi, 0.0_q, RWORK_PHI, SP_GRIDC)
 #ifdef debugsolwf
  IF (SP_IO%IU0>=0)   WRITE(SP_IO%IU0,*) 'Writing PHI_POIS'
@@ -257,8 +300,9 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
 #endif
  !chtot to real space
  CALL RC_ADD(SP_CHTOT, 1.0_q, SP_CHTOT, 0.0_q, CWORK_K, SP_GRIDC)
- CALL FFT3D(CWORK_K, SP_GRIDC, 1) 
+ CALL FFT3D(CWORK_K, SP_GRIDC, 1)
  CALL UNPACK_C2R(CWORK_K, 1.0_q, CWORK_K, 0.0_q, RWORK_CHG, SP_GRIDC)
+ ! GET_VAC_LEVEL copies RWORK_CHG and RWORK_PHI to the host itself
  CALL GET_VAC_LEVEL(SP_GRIDC, RWORK_CHG, RWORK_PHI, VACPOT_POIS)
 #ifdef debugsol
  IF (SP_IO%IU0>=0)   WRITE(SP_IO%IU0,*) 'VACPOT_POIS = ', VACPOT_POIS
@@ -266,7 +310,9 @@ SUBROUTINE Vcorrection_lpcm(SP_GRIDC, SP_LATT_CUR, SP_P, &
  !vacuum level
 
  PK_COUNTER = PK_COUNTER + 1
-      
+
+!$ACC EXIT DATA DELETE(SP_d_eps,SP_kappa2,phi_tilda,phi,Vcav,RWORK, &
+!$ACC&                 RWORK_PHI,RWORK_CHG,CWORK_K,RHOB,RHOION) __IF_ASYNC__
  DEALLOCATE(SP_d_eps, SP_kappa2, phi_tilda, phi, Vcav, RWORK)
  !vacuum level
  DEALLOCATE(RWORK_PHI)
@@ -288,7 +334,7 @@ END SUBROUTINE Vcorrection_lpcm
 !!
 !!====================================================================
 SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
-     & CE_PS_TOTN,CE_d_eps,CE_kappa2,Vcav,Acav)  
+     & CE_PS_TOTN,CE_d_eps,CE_kappa2,Vcav,Acav)
 
  IMPLICIT NONE
 
@@ -303,7 +349,7 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
 
  REAL(q),ALLOCATABLE :: CE_S(:), VWORK(:) ! shape func & Vcav
  !\nabla n and |\naba n|^2
- REAL(q),ALLOCATABLE :: CE_gn(:,:), CE_gn2_tmp(:) 
+ REAL(q),ALLOCATABLE :: CE_gn(:,:), CE_gn2_tmp(:)
  COMPLEX(q),ALLOCATABLE :: CE_gn2(:) ! |\naba n|^2
  REAL(q),ALLOCATABLE :: CE_ggn(:,:) !\nabla |\nabla n|
  REAL(q),ALLOCATABLE :: CE_ggn2(:) !| \nabla |\nabla n| |^2
@@ -312,7 +358,7 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  ! REAL(q), ALLOCATABLE       :: RWORK(:)
  RGRID, ALLOCATABLE :: RWORK(:)
 #ifndef sol_compat
- ! compimentary error function implemented in errf.F in vasp.5.lib      
+ ! compimentary error function implemented in errf.F in vasp.5.lib
  REAL(q), EXTERNAL :: ERRFC
 #endif
  INTEGER(q)             :: I, J, NPC, NPR, RLNP, RCNP
@@ -321,11 +367,22 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  INTEGER(q)             :: NG, NC, N1, N2, N3, NX, NY, NZ
  REAL(q)                :: R(3)
  !! test 7/8/14
+ ! module parameters copied to locals for use in device code
+ REAL(q)                :: OMEGA, CMIN, NCK, SIGK, EBK, K2BK, TAUK
+ INTEGER(q)             :: NPLWV
 
  NPC =  CE_GRIDC%MPLWV
  RLNP = CE_GRIDC%RL%NP
  RCNP = CE_GRIDC%RC%NP
  NPR =  DIMREAL(CE_GRIDC%MPLWV) !NPR = NPC, in complex mode
+ NPLWV = CE_GRIDC%NPLWV
+ OMEGA = CE_LATT_CUR%OMEGA
+ CMIN = CHGMIN
+ NCK  = nc_k
+ SIGK = sigma_k
+ EBK  = eb_k
+ K2BK = kappa2b_k
+ TAUK = tau
 
 #ifdef debugsol
  IF (SP_IO%IU0>=0) print *, 'NPLWV, MPLWV, RL%NP, RC%NP',&
@@ -338,6 +395,8 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  ALLOCATE(CE_ggn2(NPR), CE_ggn(3, RLNP) )
  ALLOCATE(CE_divn(NPR), CE_term1(RLNP))
  ALLOCATE(RWORK(NPR), VWORK(NPR))
+!$ACC ENTER DATA CREATE(CE_gn2,CE_S,CE_gn2_tmp,CE_gn,CE_ggn2,CE_ggn, &
+!$ACC&                  CE_divn,CE_term1,RWORK,VWORK) __IF_ASYNC__
 
  !-------------------------------------------------------------
  !volume element
@@ -347,10 +406,13 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !-------------------------------------------------------------
  !remove the scaling in the reciprocal charge density
  !-------------------------------------------------------------
- CE_PS_TOTN = CE_PS_TOTN / CE_LATT_CUR%OMEGA
+!$ACC PARALLEL LOOP PRESENT(CE_PS_TOTN) __IF_ASYNC__
+ DO I=1,NPC
+    CE_PS_TOTN(I) = CE_PS_TOTN(I) / OMEGA
+ ENDDO
 
  !-------------------------------------------------------------
- !charge density in rec space, returns \nabla n and |\nabla n|^2 
+ !charge density in rec space, returns \nabla n and |\nabla n|^2
  !in real space
  !-------------------------------------------------------------
  CALL NABLAN(CE_PS_TOTN, CE_GRIDC, CE_LATT_CUR, CE_gn2_tmp, CE_gn)
@@ -364,16 +426,18 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !-------------------------------------------------------------
  !cavitaion pot in real space
  !-------------------------------------------------------------
- Vcav = 0._q
- VWORK = 0._q
-
  !-------------------------------------------------------------
- !add -Lap(n)/|\nabla n| to Vcav and copy \sqrt(|\nabla n|^2) 
+ !add -Lap(n)/|\nabla n| to Vcav and copy \sqrt(|\nabla n|^2)
  !to CE_gn2_tmp
  !-------------------------------------------------------------
- DO I=1,DIMREAL(CE_GRIDC%MPLWV)
-   tmp = SQRT(MAX(REAL(CE_gn2_tmp(I),KIND=q),CHGMIN))
-   VWORK(I) = VWORK(I) - (CE_divn(I))/tmp
+!$ACC PARALLEL LOOP PRESENT(Vcav) __IF_ASYNC__
+ DO I=1,NPC
+    Vcav(I) = 0._q
+ ENDDO
+!$ACC PARALLEL LOOP PRESENT(VWORK,CE_divn,CE_gn2_tmp) PRIVATE(tmp) __IF_ASYNC__
+ DO I=1,NPR
+   tmp = SQRT(MAX(REAL(CE_gn2_tmp(I),KIND=q),CMIN))
+   VWORK(I) = - (CE_divn(I))/tmp
    CE_gn2_tmp(I) = tmp
  ENDDO
 
@@ -389,8 +453,8 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  CALL UNPACK_C2R(CE_PS_TOTN, 1.0_q, CE_PS_TOTN, 0.0_q, RWORK,CE_GRIDC)
 
  !-------------------------------------------------------------
- !charge density must be in real space(unscaled), 
- !returns derivative of shape function wrt the charge density 
+ !charge density must be in real space(unscaled),
+ !returns derivative of shape function wrt the charge density
  !in the real space,
  ! CE_term1 = gamma*A / n, where
  ! gamma * A = exp(-(log(n/n_c))^2 /(2 sigma^2)) /(sigma * sqrt(2*pi) )
@@ -399,7 +463,7 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
       & CE_term1)
 
  !-------------------------------------------------------------
- ! CE_S = shapefunction = N_lq/N_b, density of the solvent as a 
+ ! CE_S = shapefunction = N_lq/N_b, density of the solvent as a
  ! function of n(r) over the bulk solvent density.
  ! shapefunction value varies from 0 in the solute to 1
  ! in the solvent
@@ -409,13 +473,14 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  ! CE_kappa2 = kappa2  = kappa2b_k * shape function
  ! kappa2b_k: inverse of the square of debye length in angstroms
  !-------------------------------------------------------------
- DO I=1, CE_GRIDC%RL%NP
+!$ACC PARALLEL LOOP PRESENT(CE_S,RWORK,CE_d_eps,CE_kappa2) __IF_ASYNC__
+ DO I=1, RLNP
 
-   CE_S(I) = ERRFC( log(MAX(REAL(RWORK(I),KIND=q),CHGMIN)/nc_k) / SQRT(2._q)/sigma_k ) / 2._q
+   CE_S(I) = SOL_ERFC( log(MAX(REAL(RWORK(I),KIND=q),CMIN)/NCK) / SQRT(2._q)/SIGK ) / 2._q
 
-   CE_d_eps(I) = 1._q + (eb_k - 1._q) * CE_S(I)
+   CE_d_eps(I) = 1._q + (EBK - 1._q) * CE_S(I)
 
-   CE_kappa2(I) = kappa2b_k * CE_S(I)
+   CE_kappa2(I) = K2BK * CE_S(I)
 
  END DO
 
@@ -424,20 +489,18 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  CALL WRITE_TO_FILE(CE_GRIDC, CE_LATT_CUR, CE_T_INFO, 'EPS', CE_d_eps)
  IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) 'Writing KAPPA2'
  CALL WRITE_TO_FILE(CE_GRIDC, CE_LATT_CUR, CE_T_INFO, 'KAPPA2', CE_kappa2)
-#endif 
+#endif
 
  !-------------------------------------------------------------
- !quantum surface area
- !-------------------------------------------------------------
- CE_qs = 0._q
-
- !-------------------------------------------------------------
- !quantum surface area, integral of (gamma*A / n) * |\nabla n| 
+ !quantum surface area, integral of (gamma*A / n) * |\nabla n|
  != CE_term1 * \sqrt(CE_gn2_tmp)
  !-------------------------------------------------------------
- DO I=1, CE_GRIDC%RL%NP
+ CE_qs = 0._q
+!$ACC PARALLEL LOOP PRESENT(CE_term1,CE_gn2_tmp) REDUCTION(+:CE_qs) __IF_ASYNC__
+ DO I=1, RLNP
    CE_qs = CE_qs + (CE_term1(I)) * (CE_gn2_tmp(I))
  ENDDO
+!$ACC WAIT(ACC_ASYNC_Q) IF(OFFLOAD_ON)
 
  CE_qs = CE_qs * dv
 
@@ -459,8 +522,9 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !-------------------------------------------------------------
  !1/ |nabla n|
  !-------------------------------------------------------------
- DO I=1, DIMREAL(CE_GRIDC%MPLWV)
-   CE_gn2_tmp(I) = 1._q / ( MAX(CE_gn2_tmp(I), CHGMIN) ) 
+!$ACC PARALLEL LOOP PRESENT(CE_gn2_tmp) __IF_ASYNC__
+ DO I=1, NPR
+   CE_gn2_tmp(I) = 1._q / ( MAX(CE_gn2_tmp(I), CMIN) )
  ENDDO
 
  !-------------------------------------------------------------
@@ -475,7 +539,10 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !-------------------------------------------------------------
  CALL FFT3D(CE_gn2,CE_GRIDC,-1)
  CALL SETUNB(CE_gn2,CE_GRIDC)
- CE_gn2 = CE_gn2/CE_GRIDC%NPLWV
+!$ACC PARALLEL LOOP PRESENT(CE_gn2) __IF_ASYNC__
+ DO I=1,NPC
+    CE_gn2(I) = CE_gn2(I)/NPLWV
+ ENDDO
 
  !-------------------------------------------------------------
  !\nabla(1 / |\nabla n|), CE_ggn in real space
@@ -486,7 +553,8 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !add -(\nabla n . \nabla(1/ |\nabla n|)) to Vcav in real space
  !and multiply by CE_term1 = gamma*A/n in real space
  !-------------------------------------------------------------
- DO I=1, CE_GRIDC%RL%NP
+!$ACC PARALLEL LOOP PRESENT(VWORK,CE_gn,CE_ggn,CE_term1) PRIVATE(tmp) __IF_ASYNC__
+ DO I=1, RLNP
   tmp = ( CE_gn(1,I)*CE_ggn(1,I) + CE_gn(2,I)*CE_ggn(2,I) +&
         & CE_gn(3,I)*CE_ggn(3,I) ) * (CE_term1(I))
   VWORK(I) = VWORK(I) - tmp
@@ -499,13 +567,17 @@ SUBROUTINE CREATECAVITY(CE_GRIDC, CE_LATT_CUR, CE_P, CE_T_INFO, &
  !-------------------------------------------------------------
  CALL FFT3D(Vcav,CE_GRIDC,-1)
  CALL SETUNB(Vcav,CE_GRIDC)
- Vcav = Vcav/CE_GRIDC%NPLWV
 
  !-------------------------------------------------------------
- !multiply by the surface tension
+ !divide by NPLWV and multiply by the surface tension
  !-------------------------------------------------------------
- Vcav = Vcav * tau
+!$ACC PARALLEL LOOP PRESENT(Vcav) __IF_ASYNC__
+ DO I=1,NPC
+    Vcav(I) = (Vcav(I)/NPLWV) * TAUK
+ ENDDO
 
+!$ACC EXIT DATA DELETE(CE_gn2,CE_S,CE_gn2_tmp,CE_gn,CE_ggn2,CE_ggn, &
+!$ACC&                 CE_divn,CE_term1,RWORK,VWORK) __IF_ASYNC__
  DEALLOCATE(CE_S, RWORK, VWORK)
  DEALLOCATE(CE_gn2, CE_gn2_tmp)
  DEALLOCATE(CE_gn, CE_ggn2)
@@ -554,6 +626,10 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
  INTEGER,INTENT(OUT) :: NCGSOL
  REAL(q) :: sum_c,sum_n,sum_t,step,phi_diff,r20,maximum,maximum1,rand
  REAL(q) :: max_lp_r,max_lp_i,max_n_r,max_n_i
+ ! locals for device code
+ INTEGER :: NP, NROW, RCNP
+ REAL(q) :: K2BK, SCALE
+ REAL(q) :: B11,B12,B13,B21,B22,B23,B31,B32,B33
 
  ! ALLOCATING the local arrays
  ALLOCATE(MN_RESID(MN_GRIDC%MPLWV),MN_Z(MN_GRIDC%MPLWV))
@@ -563,52 +639,72 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
 
  ALLOCATE(gradphi_x_in(MN_GRIDC%MPLWV),gradphi_y_in(MN_GRIDC%MPLWV))
  ALLOCATE(gradphi_z_in(MN_GRIDC%MPLWV), phi_work(MN_GRIDC%MPLWV))
+!$ACC ENTER DATA CREATE(MN_RESID,MN_Z,MN_Lp,MN_GSQU,MN_d, &
+!$ACC&                  gradphi_x_in,gradphi_y_in,gradphi_z_in,phi_work) __IF_ASYNC__
+
+ !-------------------------------------------------------------
+ ! Sol_phi (CG start vector kept between calls) must live where
+ ! the kernels below run: on the device if offloading is on.
+ !-------------------------------------------------------------
+#ifdef _OPENACC
+ IF (OFFLOAD_ON .AND. .NOT. SOLPHI_ON_DEVICE) THEN
+!$ACC ENTER DATA COPYIN(Sol_phi) ASYNC(ACC_ASYNC_Q)
+    SOLPHI_ON_DEVICE = .TRUE.
+ ELSE IF (.NOT. OFFLOAD_ON .AND. SOLPHI_ON_DEVICE) THEN
+!$ACC WAIT
+!$ACC EXIT DATA COPYOUT(Sol_phi)
+    SOLPHI_ON_DEVICE = .FALSE.
+ ENDIF
+#endif
+
+ NP   = MN_GRIDC%MPLWV
+ NROW = MN_GRIDC%RC%NROW
+ RCNP = MN_GRIDC%RC%NP
+ K2BK = kappa2b_k
+ B11 = MN_LATT_CUR%B(1,1); B12 = MN_LATT_CUR%B(1,2); B13 = MN_LATT_CUR%B(1,3)
+ B21 = MN_LATT_CUR%B(2,1); B22 = MN_LATT_CUR%B(2,2); B23 = MN_LATT_CUR%B(2,3)
+ B31 = MN_LATT_CUR%B(3,1); B32 = MN_LATT_CUR%B(3,2); B33 = MN_LATT_CUR%B(3,3)
 
  count=0
  MN_beta=0._q
  MN_alpha=0._q
 ! MN_PH=0._q
- MN_phi=0._q
+!$ACC PARALLEL LOOP PRESENT(MN_phi) __IF_ASYNC__
+ DO I=1,NP
+    MN_phi(I)=0._q
+ ENDDO
  rinvLr=0._q
  r2 = 0._q
- 
- I = 0
 
  !-------------------------------------------------------------
  !calculating 1/G^2 for preconditioning
  !-------------------------------------------------------------
- col: DO NC=1,MN_GRIDC%RC%NCOL
+!$ACC PARALLEL LOOP PRESENT(MN_GRIDC,MN_GSQU) PRIVATE(N1,N2,N3,NC,GX,GY,GZ) __IF_ASYNC__
+ DO I=1,RCNP
+    N1= MOD((I-1),NROW) +1
+    NC= (I-1)/NROW+1
     N2= MN_GRIDC%RC%I2(NC)
     N3= MN_GRIDC%RC%I3(NC)
-    row: DO N1=1,MN_GRIDC%RC%NROW
-       I = I +1
-       !GX,GY,GZ
-       GX = (MN_GRIDC%LPCTX(N1)*MN_LATT_CUR%B(1,1)+MN_GRIDC%LPCTY(N2)*&
-            & MN_LATT_CUR%B(1,2)+MN_GRIDC%LPCTZ(N3)*MN_LATT_CUR%B(1,3))
+    !GX,GY,GZ
+    GX = (MN_GRIDC%LPCTX(N1)*B11+MN_GRIDC%LPCTY(N2)*B12+MN_GRIDC%LPCTZ(N3)*B13)
+    GY = (MN_GRIDC%LPCTX(N1)*B21+MN_GRIDC%LPCTY(N2)*B22+MN_GRIDC%LPCTZ(N3)*B23)
+    GZ = (MN_GRIDC%LPCTX(N1)*B31+MN_GRIDC%LPCTY(N2)*B32+MN_GRIDC%LPCTZ(N3)*B33)
 
-       GY = (MN_GRIDC%LPCTX(N1)*MN_LATT_CUR%B(2,1)+MN_GRIDC%LPCTY(N2)*&
-            & MN_LATT_CUR%B(2,2)+MN_GRIDC%LPCTZ(N3)*MN_LATT_CUR%B(2,3))
+    !set G=0 component to 1/kappa2b_k if kappa2b_k is not zero
+    IF ((MN_GRIDC%LPCTX(N1)==0).AND.(MN_GRIDC%LPCTY(N2)==0).AND.&
+         &(MN_GRIDC%LPCTZ(N3)==0)) THEN
 
-       GZ = (MN_GRIDC%LPCTX(N1)*MN_LATT_CUR%B(3,1)+MN_GRIDC%LPCTY(N2)*&
-            & MN_LATT_CUR%B(3,2)+MN_GRIDC%LPCTZ(N3)*MN_LATT_CUR%B(3,3))
-
-       !set G=0 component to 1/kappa2b_k if kappa2b_k is not zero
-       IF ((MN_GRIDC%LPCTX(N1)==0).AND.(MN_GRIDC%LPCTY(N2)==0).AND.&
-            &(MN_GRIDC%LPCTZ(N3)==0)) THEN
-          
-          IF (kappa2b_k<1E-10) THEN
-             MN_GSQU(I)= (0.0_q,0.0_q)
-          ELSE
-             MN_GSQU(I)= 1._q/kappa2b_k 
-          ENDIF
-
+       IF (K2BK<1E-10) THEN
+          MN_GSQU(I)= (0.0_q,0.0_q)
        ELSE
-          ! 1/(G^2 + kappa2b_k)
-          MN_GSQU(I) = 1._q/((GX*GX+GY*GY+GZ*GZ) * (TPI**2) + kappa2b_k)
+          MN_GSQU(I)= 1._q/K2BK
        ENDIF
-       
-    ENDDO row
- ENDDO col
+
+    ELSE
+       ! 1/(G^2 + kappa2b_k)
+       MN_GSQU(I) = 1._q/((GX*GX+GY*GY+GZ*GZ) * (TPI**2) + K2BK)
+    ENDIF
+ ENDDO
 
  !*********************************************************
  ! start of Pre-conditioned Conjugate Gradient
@@ -620,11 +716,15 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
  !unscaled charge density used
  !-------------------------------------------------------------
  IF (PK_counter ==1) THEN
-    DO I=1,MN_GRIDC%RC%NP
+!$ACC PARALLEL LOOP PRESENT(MN_phi,MN_GSQU,MN_TOTN) __IF_ASYNC__
+    DO I=1,RCNP
        MN_phi(I) = REAL(MN_GSQU(I)) * (MN_TOTN(I)) !* EDEPS / MN_LATT_CUR%OMEGA)
     ENDDO
  ELSE
-    MN_phi = Sol_phi !phi from previous vasp iteration, unscaled
+!$ACC PARALLEL LOOP PRESENT(MN_phi,Sol_phi) __IF_ASYNC__
+    DO I=1,NP
+       MN_phi(I) = Sol_phi(I) !phi from previous vasp iteration, unscaled
+    ENDDO
  ENDIF
 
  !-------------------------------------------------------------
@@ -634,7 +734,7 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
  !Both kappa^2 and epsilon are in real space
  !Lp = - A*phi
  !-------------------------------------------------------------
- CALL Leps(MN_GRIDC, MN_LATT_CUR, MN_T_INFO, MN_phi, MN_d_eps, & 
+ CALL Leps(MN_GRIDC, MN_LATT_CUR, MN_T_INFO, MN_phi, MN_d_eps, &
       & MN_kappa2, gradphi_x_in, gradphi_y_in, gradphi_z_in, &
       & phi_work, MN_Lp)
 
@@ -642,17 +742,17 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
  ! the residue
  !r = A*phi + (CHTOT + N)
  !-------------------------------------------------------------
- DO I = 1, MN_GRIDC%RC%NP
-   MN_RESID(I) = MN_Lp(I) + MN_TOTN(I) !* EDEPS / MN_LATT_CUR%OMEGA
- ENDDO
-
  !-------------------------------------------------------------
  !preconditioning of the residue, MN_Z = invL(r)
  !z = precond * r
  !-------------------------------------------------------------
- MN_Z = 0._q
-
- DO I = 1, MN_GRIDC%RC%NP
+!$ACC PARALLEL LOOP PRESENT(MN_Z) __IF_ASYNC__
+ DO I=1,NP
+    MN_Z(I) = 0._q
+ ENDDO
+!$ACC PARALLEL LOOP PRESENT(MN_RESID,MN_Lp,MN_TOTN,MN_Z,MN_GSQU) __IF_ASYNC__
+ DO I = 1, RCNP
+   MN_RESID(I) = MN_Lp(I) + MN_TOTN(I) !* EDEPS / MN_LATT_CUR%OMEGA
    MN_Z(I) = REAL(MN_GSQU(I)) * MN_RESID(I)
  ENDDO
 
@@ -671,7 +771,10 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
 
  r20 = r2
 
- MN_d = MN_Z
+!$ACC PARALLEL LOOP PRESENT(MN_d,MN_Z) __IF_ASYNC__
+ DO I=1,NP
+    MN_d(I) = MN_Z(I)
+ ENDDO
 
  !-------------------------------------------------------------
  !CG loop
@@ -692,11 +795,14 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
 
     MN_alpha = -rinvLr*MN_alpha
 
-    MN_phi = MN_phi + MN_alpha * MN_d
+!$ACC PARALLEL LOOP PRESENT(MN_phi,MN_d,MN_RESID,MN_Lp) __IF_ASYNC__
+    DO I=1,NP
+       MN_phi(I) = MN_phi(I) + MN_alpha * MN_d(I)
+       MN_RESID(I) = MN_RESID(I) +  (MN_alpha*MN_Lp(I))
+    ENDDO
 
-    MN_RESID = MN_RESID +  (MN_alpha*MN_Lp)
-
-    DO I = 1, MN_GRIDC%RC%NP
+!$ACC PARALLEL LOOP PRESENT(MN_Z,MN_GSQU,MN_RESID) __IF_ASYNC__
+    DO I = 1, RCNP
        MN_Z(I) = (REAL(MN_GSQU(I))) * MN_RESID(I)
     ENDDO
 
@@ -708,7 +814,10 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
 
     MN_beta = MN_beta * rinvLr
 
-    MN_d = MN_Z + MN_beta * MN_d
+!$ACC PARALLEL LOOP PRESENT(MN_d,MN_Z) __IF_ASYNC__
+    DO I=1,NP
+       MN_d(I) = MN_Z(I) + MN_beta * MN_d(I)
+    ENDDO
 
     r2 = 0._q
 
@@ -733,17 +842,20 @@ SUBROUTINE MINIMIZE(MN_GRIDC, MN_LATT_CUR, MN_P, MN_T_INFO, MN_d_eps,&
 
  !-------------------------------------------------------------
  !save phi for the intial guess for the next iteration
- !-------------------------------------------------------------
- Sol_phi = MN_phi 
-
- !-------------------------------------------------------------
  !multiply by e/epsilon_0 and divide by volume for CHTOT
  !-------------------------------------------------------------
- MN_phi = MN_phi * EDEPS / MN_LATT_CUR%OMEGA
+ SCALE = EDEPS / MN_LATT_CUR%OMEGA
+!$ACC PARALLEL LOOP PRESENT(Sol_phi,MN_phi) __IF_ASYNC__
+ DO I=1,NP
+    Sol_phi(I) = MN_phi(I)
+    MN_phi(I) = MN_phi(I) * SCALE
+ ENDDO
 
  !-------------------------------------------------------------
  !deallocate all the work arrays
  !-------------------------------------------------------------
+!$ACC EXIT DATA DELETE(MN_RESID,MN_Z,MN_Lp,MN_GSQU,MN_d, &
+!$ACC&                 gradphi_x_in,gradphi_y_in,gradphi_z_in,phi_work) __IF_ASYNC__
  DEALLOCATE(MN_RESID,MN_Z,MN_Lp,MN_GSQU)
  DEALLOCATE(MN_d)
  DEALLOCATE(gradphi_x_in,gradphi_y_in,gradphi_z_in,phi_work)
@@ -783,43 +895,54 @@ SUBROUTINE Leps(LPS_GRIDC, LPS_LATT_CUR, LPS_T_INFO, LPS_phi, &
  COMPLEX(q),INTENT(INOUT) :: phi_work(LPS_GRIDC%MPLWV)
 
  INTEGER(q) :: N,I,J,k,N1,N2,N3,NC
-      
+ ! locals for device code
+ INTEGER(q) :: NROW, RCNP, RLNP, NP
+ REAL(q) :: EBK
+ REAL(q) :: B11,B12,B13,B21,B22,B23,B31,B32,B33
+
  N = LPS_GRIDC%NPLWV
+ NROW = LPS_GRIDC%RC%NROW
+ RCNP = LPS_GRIDC%RC%NP
+ RLNP = LPS_GRIDC%RL%NP
+ NP   = LPS_GRIDC%MPLWV
+ EBK  = eb_k
+ B11 = LPS_LATT_CUR%B(1,1); B12 = LPS_LATT_CUR%B(1,2); B13 = LPS_LATT_CUR%B(1,3)
+ B21 = LPS_LATT_CUR%B(2,1); B22 = LPS_LATT_CUR%B(2,2); B23 = LPS_LATT_CUR%B(2,3)
+ B31 = LPS_LATT_CUR%B(3,1); B32 = LPS_LATT_CUR%B(3,2); B33 = LPS_LATT_CUR%B(3,3)
 
  !---------------------------------------------------------------------
  !Fourier transform of grad phi
  !---------------------------------------------------------------------
- DO I=1,LPS_GRIDC%RC%NP
+!$ACC PARALLEL LOOP PRESENT(LPS_GRIDC,LPS_phi,gradphi_x_in,gradphi_y_in,gradphi_z_in) &
+!$ACC& PRIVATE(N1,N2,N3,NC,GX,GY,GZ) __IF_ASYNC__
+ DO I=1,RCNP
 
-    N1= MOD((I-1),LPS_GRIDC%RC%NROW) +1
-    NC= (I-1)/LPS_GRIDC%RC%NROW+1
+    N1= MOD((I-1),NROW) +1
+    NC= (I-1)/NROW+1
     N2= LPS_GRIDC%RC%I2(NC)
     N3= LPS_GRIDC%RC%I3(NC)
 
-    GX = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(1,1)+LPS_GRIDC%LPCTY(N2)*&
-         &LPS_LATT_CUR%B(1,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(1,3))
-    GY = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(2,1)+LPS_GRIDC%LPCTY(N2)*&
-         &LPS_LATT_CUR%B(2,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(2,3))
-    GZ = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(3,1)+LPS_GRIDC%LPCTY(N2)*&
-         &LPS_LATT_CUR%B(3,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(3,3))
+    GX = (LPS_GRIDC%LPCTX(N1)*B11+LPS_GRIDC%LPCTY(N2)*B12+LPS_GRIDC%LPCTZ(N3)*B13)
+    GY = (LPS_GRIDC%LPCTX(N1)*B21+LPS_GRIDC%LPCTY(N2)*B22+LPS_GRIDC%LPCTZ(N3)*B23)
+    GZ = (LPS_GRIDC%LPCTX(N1)*B31+LPS_GRIDC%LPCTY(N2)*B32+LPS_GRIDC%LPCTZ(N3)*B33)
 
     gradphi_x_in(I) = CITPI*GX*LPS_phi(I)
     gradphi_y_in(I) = CITPI*GY*LPS_phi(I)
     gradphi_z_in(I) = CITPI*GZ*LPS_phi(I)
 
- ENDDO 
+ ENDDO
 
  !---------------------------------------------------------------------
  !gradphi to real space
  !---------------------------------------------------------------------
- CALL FFT3D(gradphi_x_in,LPS_GRIDC,1) 
- CALL FFT3D(gradphi_y_in,LPS_GRIDC,1) 
- CALL FFT3D(gradphi_z_in,LPS_GRIDC,1) 
+ CALL FFT3D(gradphi_x_in,LPS_GRIDC,1)
+ CALL FFT3D(gradphi_y_in,LPS_GRIDC,1)
+ CALL FFT3D(gradphi_z_in,LPS_GRIDC,1)
 
  !---------------------------------------------------------------------
  !phi to real space
  !---------------------------------------------------------------------
- CALL FFT3D(LPS_phi, LPS_GRIDC, 1) 
+ CALL FFT3D(LPS_phi, LPS_GRIDC, 1)
 
  !---------------------------------------------------------------------
  !multiply grad phi with epsilon in real space
@@ -828,9 +951,11 @@ SUBROUTINE Leps(LPS_GRIDC, LPS_LATT_CUR, LPS_T_INFO, LPS_phi, &
  !--------------------------------------------------------------------
 #ifdef realmode
 
- k = 1
-
- DO j = 1, DIMREAL(LPS_GRIDC%MPLWV), 2
+ ! k-th complex word holds the real-space points j=2k-1 and j=2k
+!$ACC PARALLEL LOOP PRESENT(gradphi_x_in,gradphi_y_in,gradphi_z_in,phi_work, &
+!$ACC& LPS_phi,LPS_d_eps,LPS_kappa2) PRIVATE(j) __IF_ASYNC__
+ DO k = 1, NP
+    j = 2*k-1
     gradphi_x_in(k) = CMPLX( REAL(gradphi_x_in(k),KIND=q)*LPS_d_eps(j),&
          & AIMAG(gradphi_x_in(k))*LPS_d_eps(j+1),KIND=q)
     gradphi_y_in(k) = CMPLX( REAL(gradphi_y_in(k),KIND=q)*LPS_d_eps(j),&
@@ -838,52 +963,56 @@ SUBROUTINE Leps(LPS_GRIDC, LPS_LATT_CUR, LPS_T_INFO, LPS_phi, &
     gradphi_z_in(k) = CMPLX( REAL(gradphi_z_in(k),KIND=q)*LPS_d_eps(j),&
          & AIMAG(gradphi_z_in(k))*LPS_d_eps(j+1),KIND=q)
 
-    phi_work(k) = CMPLX( REAL(LPS_phi(k),KIND=q) * eb_k * LPS_kappa2(j),&
-         & AIMAG(LPS_phi(k)) * eb_k * LPS_kappa2(j+1), KIND=q )
-
-    k = k + 1
+    phi_work(k) = CMPLX( REAL(LPS_phi(k),KIND=q) * EBK * LPS_kappa2(j),&
+         & AIMAG(LPS_phi(k)) * EBK * LPS_kappa2(j+1), KIND=q )
 
  ENDDO
 
 #else
 
- DO j = 1,LPS_GRIDC%RL%NP
+!$ACC PARALLEL LOOP PRESENT(gradphi_x_in,gradphi_y_in,gradphi_z_in,phi_work, &
+!$ACC& LPS_phi,LPS_d_eps,LPS_kappa2) __IF_ASYNC__
+ DO j = 1,RLNP
     gradphi_x_in(j) = gradphi_x_in(j)*LPS_d_eps(j)
     gradphi_y_in(j) = gradphi_y_in(j)*LPS_d_eps(j)
     gradphi_z_in(j) = gradphi_z_in(j)*LPS_d_eps(j)
     !phi_work = phi * eb_k * kappa^2, both phi and kappa2 in real space
-    phi_work(j) = LPS_phi(j) * eb_k * LPS_kappa2(j)
+    phi_work(j) = LPS_phi(j) * EBK * LPS_kappa2(j)
 
  ENDDO
 #endif
  !---------------------------------------------------------------------
  !epsilon*grad phi in kspace
  !---------------------------------------------------------------------
- CALL FFT3D(gradphi_x_in,LPS_GRIDC,-1)   
- CALL FFT3D(gradphi_y_in,LPS_GRIDC,-1)   
- CALL FFT3D(gradphi_z_in,LPS_GRIDC,-1)   
+ CALL FFT3D(gradphi_x_in,LPS_GRIDC,-1)
+ CALL FFT3D(gradphi_y_in,LPS_GRIDC,-1)
+ CALL FFT3D(gradphi_z_in,LPS_GRIDC,-1)
 
- CALL SETUNB(gradphi_x_in,LPS_GRIDC)   
- CALL SETUNB(gradphi_y_in,LPS_GRIDC)   
- CALL SETUNB(gradphi_z_in,LPS_GRIDC)   
+ CALL SETUNB(gradphi_x_in,LPS_GRIDC)
+ CALL SETUNB(gradphi_y_in,LPS_GRIDC)
+ CALL SETUNB(gradphi_z_in,LPS_GRIDC)
 
  !---------------------------------------------------------------------
  !phi_work in kspace
  !---------------------------------------------------------------------
- CALL FFT3D(phi_work, LPS_GRIDC, -1)   
+ CALL FFT3D(phi_work, LPS_GRIDC, -1)
 
- CALL SETUNB(phi_work, LPS_GRIDC)   
+ CALL SETUNB(phi_work, LPS_GRIDC)
 
  !---------------------------------------------------------------------
  !phi to k space
  !---------------------------------------------------------------------
- CALL FFT3D(LPS_phi, LPS_GRIDC, -1) 
- CALL SETUNB(LPS_phi, LPS_GRIDC)   
+ CALL FFT3D(LPS_phi, LPS_GRIDC, -1)
+ CALL SETUNB(LPS_phi, LPS_GRIDC)
 
  !---------------------------------------------------------------------
- !scaling
+ !scaling, then
+ !div(epsilon*grad phi) in kspace
+ !add the kappa^2 contrib, -phi_work
  !---------------------------------------------------------------------
- DO I=1,LPS_GRIDC%RC%NP
+!$ACC PARALLEL LOOP PRESENT(LPS_GRIDC,LPS_phi,LPS_Lp,gradphi_x_in,gradphi_y_in, &
+!$ACC& gradphi_z_in,phi_work) PRIVATE(N1,N2,N3,NC,GX,GY,GZ) __IF_ASYNC__
+ DO I=1,RCNP
    gradphi_x_in(I) = gradphi_x_in(I)/N
    gradphi_y_in(I) = gradphi_y_in(I)/N
    gradphi_z_in(I) = gradphi_z_in(I)/N
@@ -892,30 +1021,20 @@ SUBROUTINE Leps(LPS_GRIDC, LPS_LATT_CUR, LPS_T_INFO, LPS_phi, &
 
    LPS_phi(I) = LPS_phi(I)/N
 
- ENDDO
-
- !---------------------------------------------------------------------
- !div(epsilon*grad phi) in kspace
- !add the kappa^2 contrib, -phi_work
- !---------------------------------------------------------------------
- DO I=1,LPS_GRIDC%RC%NP
-   N1= MOD((I-1),LPS_GRIDC%RC%NROW) +1
-   NC= (I-1)/LPS_GRIDC%RC%NROW+1
+   N1= MOD((I-1),NROW) +1
+   NC= (I-1)/NROW+1
    N2= LPS_GRIDC%RC%I2(NC)
    N3= LPS_GRIDC%RC%I3(NC)
 
-   GX = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(1,1)+LPS_GRIDC%LPCTY(N2)*&
-        &LPS_LATT_CUR%B(1,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(1,3))
-   GY = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(2,1)+LPS_GRIDC%LPCTY(N2)*&
-        &LPS_LATT_CUR%B(2,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(2,3))
-   GZ = (LPS_GRIDC%LPCTX(N1)*LPS_LATT_CUR%B(3,1)+LPS_GRIDC%LPCTY(N2)*&
-        &LPS_LATT_CUR%B(3,2)+LPS_GRIDC%LPCTZ(N3)*LPS_LATT_CUR%B(3,3))
+   GX = (LPS_GRIDC%LPCTX(N1)*B11+LPS_GRIDC%LPCTY(N2)*B12+LPS_GRIDC%LPCTZ(N3)*B13)
+   GY = (LPS_GRIDC%LPCTX(N1)*B21+LPS_GRIDC%LPCTY(N2)*B22+LPS_GRIDC%LPCTZ(N3)*B23)
+   GZ = (LPS_GRIDC%LPCTX(N1)*B31+LPS_GRIDC%LPCTY(N2)*B32+LPS_GRIDC%LPCTZ(N3)*B33)
 
    LPS_Lp(I)= CITPI*(GX*gradphi_x_in(I) + GY*gradphi_y_in(I) + &
               &GZ*gradphi_z_in(I)) - phi_work(I)
 
  ENDDO
- 
+
  END SUBROUTINE Leps
 
 
@@ -948,19 +1067,31 @@ SUBROUTINE  EPS_POT(EPP_GRIDC, EPP_LATT_CUR, EPP_T_INFO, EPP_P, &
  REAL(q),ALLOCATABLE    :: phisq(:), RWORK(:)
  RGRID, ALLOCATABLE     :: RWORK_1(:)
  REAL(q)                :: EPP_CWORK_temp
- INTEGER(q)             :: I,J,K  
+ INTEGER(q)             :: I,J,K
+ ! locals for device code
+ INTEGER(q)             :: RLNP, RCNP, NPR, NP, NPLWV
+ REAL(q)                :: EBK, K2BK
+
+ RLNP  = EPP_GRIDC%RL%NP
+ RCNP  = EPP_GRIDC%RC%NP
+ NPR   = DIMREAL(EPP_GRIDC%MPLWV)
+ NP    = EPP_GRIDC%MPLWV
+ NPLWV = EPP_GRIDC%NPLWV
+ EBK   = eb_k
+ K2BK  = kappa2b_k
 
  ALLOCATE(eprime(EPP_GRIDC%RL%NP), kprime(EPP_GRIDC%RL%NP) )
  ALLOCATE(phisq(DIMREAL(EPP_GRIDC%MPLWV)))
  ALLOCATE(RWORK(DIMREAL(EPP_GRIDC%MPLWV)))
  ALLOCATE(RWORK_1(DIMREAL(EPP_GRIDC%MPLWV)))
+!$ACC ENTER DATA CREATE(eprime,kprime,phisq,RWORK,RWORK_1) __IF_ASYNC__
 
  !---------------------------------------------------------------------
- !SHAPE_GRADN returns eprime, the derivative of shape function wrt 
+ !SHAPE_GRADN returns eprime, the derivative of shape function wrt
  !the charge density in real space
  ! shapefunction = erfc = 1 - erf
  ! ==> -d erfc/dx = d erf/dx
- !eprime = d erf/dx, 
+ !eprime = d erf/dx,
  !so the minus sign in the potenials are taken care of
  !---------------------------------------------------------------------
  CALL SHAPE_GRADN(EPP_GRIDC, EPP_T_INFO, EPP_P, EPP_LATT_CUR, &
@@ -968,12 +1099,15 @@ SUBROUTINE  EPS_POT(EPP_GRIDC, EPP_LATT_CUR, EPP_T_INFO, EPP_P, &
  !soltest
  !CALL WRITE_TO_FILE(EPP_GRIDC, EPP_LATT_CUR, EPP_T_INFO, 'EPRIME', eprime)
  !soltest
- kprime = eprime * kappa2b_k
- eprime = eprime * (eb_k - 1._q)
+!$ACC PARALLEL LOOP PRESENT(eprime,kprime) __IF_ASYNC__
+ DO I=1,RLNP
+    kprime(I) = eprime(I) * K2BK
+    eprime(I) = eprime(I) * (EBK - 1._q)
+ ENDDO
 
  !---------------------------------------------------------------------
  !EPP_phi,the solution to the generalized poisson equation,
- ! is in reciprocal space, 
+ ! is in reciprocal space,
  !NABLAN returns |\nabla phi| ^2 in real space
  !---------------------------------------------------------------------
  CALL NABLAN(EPP_phi,EPP_GRIDC,EPP_LATT_CUR,phisq)
@@ -981,7 +1115,7 @@ SUBROUTINE  EPS_POT(EPP_GRIDC, EPP_LATT_CUR, EPP_T_INFO, EPP_P, &
  !---------------------------------------------------------------------
  !phi to real space
  !---------------------------------------------------------------------
- CALL FFT3D(EPP_phi, EPP_GRIDC, 1) 
+ CALL FFT3D(EPP_phi, EPP_GRIDC, 1)
 
  CALL UNPACK_C2R(EPP_phi, 1.0_q, EPP_phi, 0.0_q, RWORK_1, EPP_GRIDC)
 
@@ -994,43 +1128,51 @@ SUBROUTINE  EPS_POT(EPP_GRIDC, EPP_LATT_CUR, EPP_T_INFO, EPP_P, &
  !---------------------------------------------------------------------
  ! eps potential in real space
  !---------------------------------------------------------------------
- EPP_CWORK_temp = 0._q
-
  !---------------------------------------------------------------------
  !multiply eprime and phisq in real space
  !add kappa^2 term, eb_k * kprime * phi^2 in real space
  !---------------------------------------------------------------------
- RWORK = 0._q
+!$ACC PARALLEL LOOP PRESENT(RWORK) __IF_ASYNC__
+ DO I = 1, NPR
+    RWORK(I) = 0._q
+ ENDDO
 
- DO I = 1, EPP_GRIDC%RL%NP
+!$ACC PARALLEL LOOP PRESENT(RWORK,eprime,phisq,kprime,RWORK_1) &
+!$ACC& PRIVATE(EPP_CWORK_temp) __IF_ASYNC__
+ DO I = 1, RLNP
     EPP_CWORK_temp = eprime(I) * phisq(I) + &
-         & eb_k * kprime(I) * RWORK_1(I) * RWORK_1(I)
+         & EBK * kprime(I) * RWORK_1(I) * RWORK_1(I)
     RWORK(I) = EPP_CWORK_temp
  ENDDO
 
  !---------------------------------------------------------------------
  !phi to k space
  !---------------------------------------------------------------------
- CALL FFT3D(EPP_phi, EPP_GRIDC, -1) 
+ CALL FFT3D(EPP_phi, EPP_GRIDC, -1)
 
  !---------------------------------------------------------------------
  !scale phi
  !---------------------------------------------------------------------
- DO I=1,EPP_GRIDC%RC%NP
-   EPP_phi(I) = EPP_phi(I)/EPP_GRIDC%NPLWV
+!$ACC PARALLEL LOOP PRESENT(EPP_phi) __IF_ASYNC__
+ DO I=1,RCNP
+   EPP_phi(I) = EPP_phi(I)/NPLWV
  ENDDO
 
  CALL PACK_R2C(RWORK, EPP_CWORK, EPP_GRIDC)
-   
+
  !---------------------------------------------------------------------
  !take the eps potential to reciprocal space
  !---------------------------------------------------------------------
  CALL FFT3D(EPP_CWORK,EPP_GRIDC,-1)
  CALL SETUNB(EPP_CWORK,EPP_GRIDC)
- EPP_CWORK = EPP_CWORK/EPP_GRIDC%NPLWV
+!$ACC PARALLEL LOOP PRESENT(EPP_CWORK) __IF_ASYNC__
+ DO I=1,NP
+    EPP_CWORK(I) = EPP_CWORK(I)/NPLWV
+ ENDDO
 
+!$ACC EXIT DATA DELETE(eprime,kprime,phisq,RWORK,RWORK_1) __IF_ASYNC__
  DEALLOCATE(eprime, kprime, phisq, RWORK, RWORK_1)
- 
+
  RETURN
 
 END SUBROUTINE EPS_POT
@@ -1038,7 +1180,7 @@ END SUBROUTINE EPS_POT
 
 !>======================SUBROUTINE SHAPE_GRADN========================
 !!
-!!calculates first derivative of the shape function  wrt CHTOT 
+!!calculates first derivative of the shape function  wrt CHTOT
 !!in realspace
 !!
 !!====================================================================
@@ -1058,13 +1200,22 @@ SUBROUTINE SHAPE_GRADN(EPR_GRIDC, EPR_T_INFO, EPR_P, EPR_LATT_CUR, &
 
  !local variables
  REAL(q) ::EPR_C,eprime_temp,EPR_Z
- INTEGER I 
+ INTEGER I
+ ! locals for device code
+ INTEGER :: RLNP
+ REAL(q) :: CMIN, NCK, SIGK
 
- EPR_C = 1._q / sqrt(2*PI) / sigma_k
+ RLNP = EPR_GRIDC%RL%NP
+ CMIN = CHGMIN
+ NCK  = nc_k
+ SIGK = sigma_k
 
- DO I=1, EPR_GRIDC%RL%NP
-    EPR_Z = log(MAX(REAL(EPR_PS_TOTN(I),KIND=q),CHGMIN)/nc_k) / sqrt(2._q) / sigma_k
-    eprime(I) = EPR_C * (EXP(-(EPR_Z)**2)) / (MAX(REAL(EPR_PS_TOTN(I),KIND=q),CHGMIN))
+ EPR_C = 1._q / sqrt(2*PI) / SIGK
+
+!$ACC PARALLEL LOOP PRESENT(EPR_PS_TOTN,eprime) PRIVATE(EPR_Z) __IF_ASYNC__
+ DO I=1, RLNP
+    EPR_Z = log(MAX(REAL(EPR_PS_TOTN(I),KIND=q),CMIN)/NCK) / sqrt(2._q) / SIGK
+    eprime(I) = EPR_C * (EXP(-(EPR_Z)**2)) / (MAX(REAL(EPR_PS_TOTN(I),KIND=q),CMIN))
  END DO
 
  RETURN
@@ -1090,100 +1241,75 @@ SUBROUTINE NABLAN(D_PHI, D_GRIDC, D_LATT_CUR, D_PHI2, D_grad)
  REAL(q),INTENT(OUT)           :: D_PHI2(DIMREAL(D_GRIDC%MPLWV))
  REAL(q), OPTIONAL,INTENT(OUT) :: D_grad(3, D_GRIDC%RL%NP)
 !local variables
- COMPLEX(q),ALLOCATABLE        :: CR(:)  
+ COMPLEX(q),ALLOCATABLE        :: CR(:)
  RGRID,ALLOCATABLE             :: RWORK(:)
 
  INTEGER(q)                    :: I,N1,N2,N3,NC
  REAL(q)                       :: GX,GY,GZ,tmp
- 
+ ! locals for device code
+ INTEGER(q)                    :: ID, NROW, RCNP, RLNP, NPR
+ REAL(q)                       :: BX, BY, BZ, G
+ LOGICAL                       :: LGRAD
+
+ NROW = D_GRIDC%RC%NROW
+ RCNP = D_GRIDC%RC%NP
+ RLNP = D_GRIDC%RL%NP
+ NPR  = DIMREAL(D_GRIDC%MPLWV)
+ LGRAD = PRESENT(D_grad)
+
  ALLOCATE( CR(D_GRIDC%MPLWV), RWORK(DIMREAL(D_GRIDC%MPLWV)) )
+!$ACC ENTER DATA CREATE(CR,RWORK) __IF_ASYNC__
 
- D_PHI2 = 0._q
-
- !---------------------------------------------------------------------
- ! x-component:
- !---------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
-
-   GX = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(1,1)+D_GRIDC%LPCTY(N2)*&
-        & D_LATT_CUR%B(1,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(1,3))
-
-   CR(I) = D_PHI(I) * GX * CITPI
- ENDDO
- !---------------------------------------------------------------------
- ! gradphi_x to real space:
- !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
-
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
-
- DO I=1, D_GRIDC%RL%NP
-   tmp = REAL(RWORK(I),KIND=q)
-   D_PHI2(I) = D_PHI2(I) + tmp * tmp
-   IF (PRESENT(D_grad)) D_grad(1,I) = tmp
- ENDDO
- !--------------------------------------------------------------------
- ! y-component:
- !--------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
-
-   GY = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(2,1)+D_GRIDC%LPCTY(N2)*&
-         &D_LATT_CUR%B(2,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(2,3))
-
-   CR(I) = D_PHI(I) * GY * CITPI
+!$ACC PARALLEL LOOP PRESENT(D_PHI2) __IF_ASYNC__
+ DO I=1,NPR
+    D_PHI2(I) = 0._q
  ENDDO
 
  !---------------------------------------------------------------------
- ! grad_y to real space:
+ ! ID=1,2,3: x-, y- and z-component of the gradient
+ ! G_ID = LPCTX*B(ID,1) + LPCTY*B(ID,2) + LPCTZ*B(ID,3)
  !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
+ DO ID=1,3
+   BX = D_LATT_CUR%B(ID,1)
+   BY = D_LATT_CUR%B(ID,2)
+   BZ = D_LATT_CUR%B(ID,3)
 
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
+!$ACC PARALLEL LOOP PRESENT(D_GRIDC,D_PHI,CR) PRIVATE(N1,N2,N3,NC,G) __IF_ASYNC__
+   DO I=1,RCNP
+     N1= MOD((I-1),NROW) +1
+     NC= (I-1)/NROW+1
+     N2= D_GRIDC%RC%I2(NC)
+     N3= D_GRIDC%RC%I3(NC)
 
- DO I=1, D_GRIDC%RL%NP
-   tmp = REAL(RWORK(I),KIND=q)
-   D_PHI2(I) = D_PHI2(I) + tmp * tmp
-   IF (PRESENT(D_grad)) D_grad(2,I) = tmp
+     G = (D_GRIDC%LPCTX(N1)*BX+D_GRIDC%LPCTY(N2)*BY+D_GRIDC%LPCTZ(N3)*BZ)
+
+     CR(I) = D_PHI(I) * G * CITPI
+   ENDDO
+   !-------------------------------------------------------------------
+   ! gradient component to real space:
+   !-------------------------------------------------------------------
+   CALL SETUNB(CR,D_GRIDC)
+   CALL FFT3D(CR,D_GRIDC,1)
+
+   CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
+
+   IF (LGRAD) THEN
+!$ACC PARALLEL LOOP PRESENT(RWORK,D_PHI2,D_grad) PRIVATE(tmp) __IF_ASYNC__
+     DO I=1, RLNP
+       tmp = REAL(RWORK(I),KIND=q)
+       D_PHI2(I) = D_PHI2(I) + tmp * tmp
+       D_grad(ID,I) = tmp
+     ENDDO
+   ELSE
+!$ACC PARALLEL LOOP PRESENT(RWORK,D_PHI2) PRIVATE(tmp) __IF_ASYNC__
+     DO I=1, RLNP
+       tmp = REAL(RWORK(I),KIND=q)
+       D_PHI2(I) = D_PHI2(I) + tmp * tmp
+     ENDDO
+   ENDIF
  ENDDO
- !--------------------------------------------------------------------
- ! z-component:
- !--------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
 
-   GZ = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(3,1)+D_GRIDC%LPCTY(N2)*&
-         &D_LATT_CUR%B(3,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(3,3))
-
-   CR(I)=D_PHI(I) * GZ * CITPI
- ENDDO
-
- !---------------------------------------------------------------------
- ! grad_z to real space:
- !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
-
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
-
- DO I=1, D_GRIDC%RL%NP
-   tmp = REAL(RWORK(I),KIND=q)
-   D_PHI2(I) = D_PHI2(I) + tmp * tmp
-   IF (PRESENT(D_grad)) D_grad(3,I) = tmp
-  ENDDO
-
+!$ACC EXIT DATA DELETE(CR,RWORK) __IF_ASYNC__
  DEALLOCATE(CR,RWORK)
 
  RETURN
@@ -1212,91 +1338,59 @@ SUBROUTINE LAPLN(D_PHI,D_GRIDC,D_LATT_CUR,D_PHI2)
  RGRID, ALLOCATABLE       :: RWORK(:)
  INTEGER(q)               :: I,N1,N2,N3,NC
  REAL(q)                  :: GX,GY,GZ
- 
+ ! locals for device code
+ INTEGER(q)               :: ID, NROW, RCNP, RLNP, NPR
+ REAL(q)                  :: BX, BY, BZ, G
+
+ NROW = D_GRIDC%RC%NROW
+ RCNP = D_GRIDC%RC%NP
+ RLNP = D_GRIDC%RL%NP
+ NPR  = DIMREAL(D_GRIDC%MPLWV)
+
  ALLOCATE(CR(D_GRIDC%MPLWV), RWORK(DIMREAL(D_GRIDC%MPLWV)))
+!$ACC ENTER DATA CREATE(CR,RWORK) __IF_ASYNC__
 
- D_PHI2 = 0._q
-
- !---------------------------------------------------------------------
- ! x-component:
- !---------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
-
-   GX = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(1,1)+D_GRIDC%LPCTY(N2)*&
-       &D_LATT_CUR%B(1,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(1,3))
-
-   CR(I) = D_PHI(I) * (GX*CITPI)**2.0
+!$ACC PARALLEL LOOP PRESENT(D_PHI2) __IF_ASYNC__
+ DO I=1,NPR
+    D_PHI2(I) = 0._q
  ENDDO
 
  !---------------------------------------------------------------------
- ! gradphi to real space:
+ ! ID=1,2,3: d^2/dx^2, d^2/dy^2, d^2/dz^2
+ ! (G*i*2pi)^2 is evaluated with an integer exponent
  !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
+ DO ID=1,3
+   BX = D_LATT_CUR%B(ID,1)
+   BY = D_LATT_CUR%B(ID,2)
+   BZ = D_LATT_CUR%B(ID,3)
 
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
+!$ACC PARALLEL LOOP PRESENT(D_GRIDC,D_PHI,CR) PRIVATE(N1,N2,N3,NC,G) __IF_ASYNC__
+   DO I=1,RCNP
+     N1= MOD((I-1),NROW) +1
+     NC= (I-1)/NROW+1
+     N2= D_GRIDC%RC%I2(NC)
+     N3= D_GRIDC%RC%I3(NC)
 
- DO I=1, D_GRIDC%RL%NP
-    D_PHI2(I) = D_PHI2(I) + REAL(RWORK(I),KIND=q)
+     G = (D_GRIDC%LPCTX(N1)*BX+D_GRIDC%LPCTY(N2)*BY+D_GRIDC%LPCTZ(N3)*BZ)
+
+     CR(I) = D_PHI(I) * (G*CITPI)**2
+   ENDDO
+
+   !-------------------------------------------------------------------
+   ! to real space:
+   !-------------------------------------------------------------------
+   CALL SETUNB(CR,D_GRIDC)
+   CALL FFT3D(CR,D_GRIDC,1)
+
+   CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
+
+!$ACC PARALLEL LOOP PRESENT(D_PHI2,RWORK) __IF_ASYNC__
+   DO I=1, RLNP
+      D_PHI2(I) = D_PHI2(I) + REAL(RWORK(I),KIND=q)
+   ENDDO
  ENDDO
 
- !---------------------------------------------------------------------
- ! y-component:
- !---------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
-
-   GY = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(2,1)+D_GRIDC%LPCTY(N2)*&
-         &D_LATT_CUR%B(2,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(2,3))
-
-   CR(I) = D_PHI(I) * (GY*CITPI)**2
- ENDDO
-
- !---------------------------------------------------------------------
- ! grad_y to real space:
- !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
-
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
-
- DO I=1, D_GRIDC%RL%NP
-    D_PHI2(I) = D_PHI2(I) + REAL(RWORK(I),KIND=q)
- ENDDO
- !---------------------------------------------------------------------
- ! z-component:
- !---------------------------------------------------------------------
- DO I=1,D_GRIDC%RC%NP
-   N1= MOD((I-1),D_GRIDC%RC%NROW) +1
-   NC= (I-1)/D_GRIDC%RC%NROW+1
-   N2= D_GRIDC%RC%I2(NC)
-   N3= D_GRIDC%RC%I3(NC)
-
-   GZ = (D_GRIDC%LPCTX(N1)*D_LATT_CUR%B(3,1)+D_GRIDC%LPCTY(N2)*&
-         &D_LATT_CUR%B(3,2)+D_GRIDC%LPCTZ(N3)*D_LATT_CUR%B(3,3))
-
-   CR(I)=D_PHI(I) * (GZ*CITPI)**2.0
- ENDDO
-
- !---------------------------------------------------------------------
- ! grad_z to real space:
- !---------------------------------------------------------------------
- CALL SETUNB(CR,D_GRIDC)
- CALL FFT3D(CR,D_GRIDC,1)
-
- CALL UNPACK_C2R(CR, 1.0_q, CR, 0.0_q, RWORK, D_GRIDC)
-
- DO I=1, D_GRIDC%RL%NP
-  D_PHI2(I) = D_PHI2(I) + REAL(RWORK(I),KIND=q)
- ENDDO
-
+!$ACC EXIT DATA DELETE(CR,RWORK) __IF_ASYNC__
  DEALLOCATE(CR,RWORK)
 
  RETURN
@@ -1316,50 +1410,49 @@ SUBROUTINE SimplePoisson(GC_GRIDC,GC_LATT_CUR,GC_IN,GC_OUT,GFLAG)
  TYPE (grid_3d),INTENT(IN) :: GC_GRIDC
  TYPE (latt),INTENT(IN) :: GC_LATT_CUR
  COMPLEX(q),INTENT(OUT) ::  GC_OUT(GC_GRIDC%MPLWV)
- COMPLEX(q),INTENT(IN) :: GC_IN(GC_GRIDC%MPLWV)  
+ COMPLEX(q),INTENT(IN) :: GC_IN(GC_GRIDC%MPLWV)
  REAL(q) GX,GY,GZ,GSQU,SCALE
  INTEGER I,NC,N1,N2,N3,GFLAG
+ ! locals for device code
+ INTEGER :: NROW, RCNP
+ REAL(q) :: B11,B12,B13,B21,B22,B23,B31,B32,B33
 
  SCALE = EDEPS/GC_LATT_CUR%OMEGA/TPI**2
- I = 0
+ NROW = GC_GRIDC%RC%NROW
+ RCNP = GC_GRIDC%RC%NP
+ B11 = GC_LATT_CUR%B(1,1); B12 = GC_LATT_CUR%B(1,2); B13 = GC_LATT_CUR%B(1,3)
+ B21 = GC_LATT_CUR%B(2,1); B22 = GC_LATT_CUR%B(2,2); B23 = GC_LATT_CUR%B(2,3)
+ B31 = GC_LATT_CUR%B(3,1); B32 = GC_LATT_CUR%B(3,2); B33 = GC_LATT_CUR%B(3,3)
 
- col: DO NC=1,GC_GRIDC%RC%NCOL
-
+!$ACC PARALLEL LOOP PRESENT(GC_GRIDC,GC_IN,GC_OUT) PRIVATE(N1,N2,N3,NC,GX,GY,GZ,GSQU) __IF_ASYNC__
+ DO I=1,RCNP
+    N1= MOD((I-1),NROW) +1
+    NC= (I-1)/NROW+1
     N2= GC_GRIDC%RC%I2(NC)
     N3= GC_GRIDC%RC%I3(NC)
 
-    row: DO N1=1,GC_GRIDC%RC%NROW
-       I=I+1
+    GX = (GC_GRIDC%LPCTX(N1)*B11+GC_GRIDC%LPCTY(N2)*B12+GC_GRIDC%LPCTZ(N3)*B13)
+    GY = (GC_GRIDC%LPCTX(N1)*B21+GC_GRIDC%LPCTY(N2)*B22+GC_GRIDC%LPCTZ(N3)*B23)
+    GZ = (GC_GRIDC%LPCTX(N1)*B31+GC_GRIDC%LPCTY(N2)*B32+GC_GRIDC%LPCTZ(N3)*B33)
 
-       GX = (GC_GRIDC%LPCTX(N1)*GC_LATT_CUR%B(1,1)+&
-            &GC_GRIDC%LPCTY(N2)*GC_LATT_CUR%B(1,2)+&
-            &GC_GRIDC%LPCTZ(N3)*GC_LATT_CUR%B(1,3))
-       GY = (GC_GRIDC%LPCTX(N1)*GC_LATT_CUR%B(2,1)+&
-            &GC_GRIDC%LPCTY(N2)*GC_LATT_CUR%B(2,2)+&
-            &GC_GRIDC%LPCTZ(N3)*GC_LATT_CUR%B(2,3))
-       GZ = (GC_GRIDC%LPCTX(N1)*GC_LATT_CUR%B(3,1)+&
-            &GC_GRIDC%LPCTY(N2)*GC_LATT_CUR%B(3,2)+&
-            &GC_GRIDC%LPCTZ(N3)*GC_LATT_CUR%B(3,3))
-       
-       GSQU=GX**2+GY**2+GZ**2
-       
-       IF (GFLAG == 1) THEN
+    GSQU=GX**2+GY**2+GZ**2
 
-          IF ((GC_GRIDC%LPCTX(N1)==0).AND.&
-               &(GC_GRIDC%LPCTY(N2)==0).AND.&
-               &(GC_GRIDC%LPCTZ(N3)==0)) THEN
-             
-             GC_OUT(I)=(0.0_q,0.0_q)
-          ELSE
-             GC_OUT(I)=(GC_IN(I))/GSQU*SCALE
-          ENDIF
+    IF (GFLAG == 1) THEN
 
-       ELSEIF (GFLAG == 0) THEN
-          GC_OUT(I)=(GC_IN(I))*GSQU/SCALE         
+       IF ((GC_GRIDC%LPCTX(N1)==0).AND.&
+            &(GC_GRIDC%LPCTY(N2)==0).AND.&
+            &(GC_GRIDC%LPCTZ(N3)==0)) THEN
+
+          GC_OUT(I)=(0.0_q,0.0_q)
+       ELSE
+          GC_OUT(I)=(GC_IN(I))/GSQU*SCALE
        ENDIF
 
-    ENDDO row
- ENDDO col
+    ELSEIF (GFLAG == 0) THEN
+       GC_OUT(I)=(GC_IN(I))*GSQU/SCALE
+    ENDIF
+
+ ENDDO
 
  RETURN
 
@@ -1370,6 +1463,7 @@ END SUBROUTINE SimplePoisson
 !!
 !! helper routine for dot product
 !! also used in pot_k.F
+!! The result is returned on the host (the routine waits for the GPU).
 !!
 !!==================================================================
 SUBROUTINE MY_D_PROD(D_P_val,ARRAY1,ARRAY2,GRIDC)
@@ -1383,19 +1477,28 @@ SUBROUTINE MY_D_PROD(D_P_val,ARRAY1,ARRAY2,GRIDC)
  REAL(q),INTENT(OUT) :: D_P_val
  REAL(q) :: FACTM
  INTEGER :: I, NC, N1, N2, N3
+ ! locals for device code
+ INTEGER :: NROW, RCNP
+ REAL(q) :: SUMV
 
- D_P_val = 0._q
- I = 1
- col: DO NC=1,GRIDC%RC%NCOL
+ NROW = GRIDC%RC%NROW
+ RCNP = GRIDC%RC%NP
+ SUMV = 0._q
+
+!$ACC PARALLEL LOOP PRESENT(GRIDC,ARRAY1,ARRAY2) PRIVATE(N1,N2,N3,NC,FACTM) &
+!$ACC& REDUCTION(+:SUMV) __IF_ASYNC__
+ DO I=1,RCNP
+    N1= MOD((I-1),NROW) +1
+    NC= (I-1)/NROW+1
     N2= GRIDC%RC%I2(NC)
     N3= GRIDC%RC%I3(NC)
-    row: DO N1=1,GRIDC%RC%NROW
-       SETFACT1
-       SETFACT
-       D_P_val = D_P_val + MULFACT (ARRAY1(I)) * CONJG(ARRAY2(I))
-       I=I+1
-    ENDDO row
- ENDDO col
+    SETFACT1
+    SETFACT
+    SUMV = SUMV + MULFACT REAL( ARRAY1(I) * CONJG(ARRAY2(I)), KIND=q)
+ ENDDO
+!$ACC WAIT(ACC_ASYNC_Q) IF(OFFLOAD_ON)
+
+ D_P_val = SUMV
 
  RETURN
 
@@ -1416,15 +1519,18 @@ SUBROUTINE PACK_R2C(RA,CB,GRIDC)
  REAL(q)    :: RA(DIMREAL(GRIDC%MPLWV))
  COMPLEX(q) :: CB(GRIDC%MPLWV)
  INTEGER(q) :: I,J
+ INTEGER(q) :: NP
+
+ NP = GRIDC%MPLWV
 
 #ifdef realmode
- J = 1
- DO I= 1,DIMREAL(GRIDC%MPLWV),2
-   CB(J) = CMPLX(RA(I),RA(I+1))
-   J = J + 1
+!$ACC PARALLEL LOOP PRESENT(RA,CB) __IF_ASYNC__
+ DO J= 1,NP
+   CB(J) = CMPLX(RA(2*J-1),RA(2*J))
  ENDDO
 #else
- DO I= 1,DIMREAL(GRIDC%MPLWV)
+!$ACC PARALLEL LOOP PRESENT(RA,CB) __IF_ASYNC__
+ DO I= 1,NP
   CB(I) = CMPLX(RA(I))
  ENDDO
 #endif
@@ -1451,13 +1557,12 @@ SUBROUTINE UNPACK_C2R(A,SCALE1,B,SCALE2,C,GRID)
  INTEGER(q) :: NP, I ,J
 
  NP = GRID%MPLWV
- 
- J = 1
+
+!$ACC PARALLEL LOOP PRESENT(A,B,C) __IF_ASYNC__
  DO I=1,NP
 #ifdef realmode
-    C(J) = REAL(A(I),KIND=q)* SCALE1 + REAL(B(I),KIND=q)* SCALE2
-    C(J+1) = AIMAG(A(I))* SCALE1 + AIMAG(B(I))* SCALE2 
-    J = J + 2
+    C(2*I-1) = REAL(A(I),KIND=q)* SCALE1 + REAL(B(I),KIND=q)* SCALE2
+    C(2*I) = AIMAG(A(I))* SCALE1 + AIMAG(B(I))* SCALE2
 #else
     C(I) = A(I) * SCALE1 + B(I) * SCALE2
 #endif
@@ -1495,6 +1600,9 @@ SUBROUTINE WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, FNAME, CVTOT)
  INTEGER :: ISTAT, NODE_ME, IONODE, IU
  INTEGER :: NALLOC, NZ, NWRITE, NWRITTEN, N
  !REAL(q),ALLOCATABLE ::  AVG_XY(:)
+
+ ! the array may be a device array: bring its current values to the host
+!$ACC UPDATE SELF(CVTOT) IF_PRESENT IF(OFFLOAD_ON) WAIT(ACC_ASYNC_Q)
 
  NODE_ME = 0
  IONODE = 0
@@ -1599,6 +1707,9 @@ SUBROUTINE GET_VAC_LEVEL(GRIDC, CHTOT, CVTOT, VACPOT)
  INTEGER,PARAMETER :: NWIN = 3
  REAL(q) :: WINDOW(-NWIN:NWIN) = (/0.1,0.2,0.3,0.4,0.3,0.2,0.1/)
 
+ ! the arrays may be device arrays: bring their current values to the host
+!$ACC UPDATE SELF(CHTOT,CVTOT) IF_PRESENT IF(OFFLOAD_ON) WAIT(ACC_ASYNC_Q)
+
  ALLOCATE(DENLIN(MAX(GRIDC%NGX,GRIDC%NGY,GRIDC%NGZ)) )
  
  DENMIN = 1E9
@@ -1669,29 +1780,39 @@ SUBROUTINE COMPUTE_RHOB(GRIDC, LATT_CUR, T_INFO, EPSILON, PHI, RHOB)
   COMPLEX(q),ALLOCATABLE :: phi_work(:), C_RHOB(:)
 
   RGRID,ALLOCATABLE :: DUMMY_KAPPA2(:)
+  INTEGER(q) :: I, NPR
+
+  NPR = DIMREAL(GRIDC%MPLWV)
 
   ALLOCATE(C_RHOB(GRIDC%MPLWV))
   ALLOCATE(DUMMY_KAPPA2(DIMREAL(GRIDC%MPLWV)))
   ALLOCATE(gradphi_x_in(GRIDC%MPLWV),gradphi_y_in(GRIDC%MPLWV))
   ALLOCATE(gradphi_z_in(GRIDC%MPLWV), PHI_WORK(GRIDC%MPLWV))
+!$ACC ENTER DATA CREATE(C_RHOB,DUMMY_KAPPA2,gradphi_x_in,gradphi_y_in, &
+!$ACC&                  gradphi_z_in,PHI_WORK) __IF_ASYNC__
 
-  DUMMY_KAPPA2 = 0._q
-  !epsilon -1 
-  EPSILON = EPSILON - 1._q
-  
+  !epsilon -1
+!$ACC PARALLEL LOOP PRESENT(DUMMY_KAPPA2,EPSILON) __IF_ASYNC__
+  DO I=1,NPR
+     DUMMY_KAPPA2(I) = 0._q
+     EPSILON(I) = EPSILON(I) - 1._q
+  ENDDO
+
   !div(epsilon grap phi)
-  CALL Leps(GRIDC, LATT_CUR, T_INFO, PHI, EPSILON, & 
+  CALL Leps(GRIDC, LATT_CUR, T_INFO, PHI, EPSILON, &
       & DUMMY_KAPPA2, gradphi_x_in, gradphi_y_in, gradphi_z_in, &
       & phi_work, C_RHOB)
 
   !rhob in real space
-  CALL FFT3D(C_RHOB, GRIDC, 1) 
+  CALL FFT3D(C_RHOB, GRIDC, 1)
   CALL UNPACK_C2R(C_RHOB, 1.0_q, C_RHOB, 0.0_q, RHOB, GRIDC)
 
-  !write to file
+  !write to file (WRITE_TO_FILE copies RHOB to the host itself)
   IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) 'Writing RHOB'
   CALL WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, 'RHOB', RHOB)
 
+!$ACC EXIT DATA DELETE(C_RHOB,DUMMY_KAPPA2,gradphi_x_in,gradphi_y_in, &
+!$ACC&                 gradphi_z_in,PHI_WORK) __IF_ASYNC__
   DEALLOCATE(C_RHOB, DUMMY_KAPPA2)
   DEALLOCATE(gradphi_x_in, gradphi_y_in)
   DEALLOCATE(gradphi_z_in, PHI_WORK)
@@ -1720,27 +1841,32 @@ SUBROUTINE COMPUTE_RHOION(GRIDC, LATT_CUR, T_INFO, KAPPA2, PHI,RHOION)
 
   RGRID,ALLOCATABLE :: R_PHI(:)
 
-  INTEGER(q) :: I
+  INTEGER(q) :: I, RLNP
+
+  RLNP = GRIDC%RL%NP
 
   ALLOCATE(R_PHI(DIMREAL(GRIDC%MPLWV)))
+!$ACC ENTER DATA CREATE(R_PHI) __IF_ASYNC__
 
   !phi to real space
-  CALL FFT3D(PHI, GRIDC, 1) 
+  CALL FFT3D(PHI, GRIDC, 1)
   CALL UNPACK_C2R(PHI, 1.0_q, PHI, 0.0_q, R_PHI, GRIDC)
-  
+
   ! rhoion = - kappa^2 * phi
   ! in real space
-  DO I = 1, GRIDC%RL%NP
+!$ACC PARALLEL LOOP PRESENT(RHOION,KAPPA2,R_PHI) __IF_ASYNC__
+  DO I = 1, RLNP
      RHOION(I) = -KAPPA2(I) * R_PHI(I)
   ENDDO
 
-  !write to file
+  !write to file (WRITE_TO_FILE copies RHOION to the host itself)
   IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) 'Writing RHOION'
   CALL WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, 'RHOION', RHOION)
 
+!$ACC EXIT DATA DELETE(R_PHI) __IF_ASYNC__
   DEALLOCATE(R_PHI)
 
-  RETURN 
+  RETURN
 
 END SUBROUTINE COMPUTE_RHOION
 
@@ -1765,6 +1891,7 @@ MODULE POT_K
  USE mpimy 
  USE pot_lpcm_k, ONLY : Vcorrection_lpcm, MY_D_PROD, SP_IO, SimplePoisson
  USE pot_lpcm_k, ONLY : GET_VAC_LEVEL, VACPOT_POIS, UNPACK_C2R
+GPACC USE moffload_struct_def, ONLY : OFFLOAD_ON, ACC_ASYNC_Q
 #ifdef debugsolwf
  USE pot_lpcm_k, ONLY : WRITE_TO_FILE
 #endif
@@ -2067,12 +2194,15 @@ MODULE POT_K
  SUBROUTINE Vcorrection(SP_GRIDC, SP_P, SP_LATT_CUR, SP_T_INFO, WDES,&
                       & SP_CHTOT, Vcorr, Ecorr, EIFOR_SOL)
 
-  USE constant 
-  USE poscar, ONLY : type_info 
-  USE lattice, ONLY : latt, DIRKAR 
+  USE constant
+  USE poscar, ONLY : type_info
+  USE lattice, ONLY : latt, DIRKAR
   USE mgrid, ONLY : grid_3d
   USE pseudo, ONLY : potcar
   USE wave, ONLY : wavedes
+#ifdef jdftx
+GPACC USE moffload_control, ONLY : OFFLOAD_ON_PUSH, OFFLOAD_ON_POP
+#endif
 
   IMPLICIT NONE
 
@@ -2090,10 +2220,13 @@ MODULE POT_K
   COMPLEX(q),ALLOCATABLE :: Vdiel(:)
   COMPLEX(q),ALLOCATABLE :: PS_TOTN(:)
   ! electrost. pot. diff * n   and Vdiel * n respectively
-  REAL(q) :: Ecorr3, Ecorr4 
+  REAL(q) :: Ecorr3, Ecorr4
   REAL(q),INTENT(OUT) :: Ecorr ! Atot - Ecorr3 - Ecorr4
   INTEGER(q) :: I,J,K
   REAL(q)  :: dx,dy,dz,dv
+  INTEGER(q) :: NP
+
+  NP = SP_GRIDC%MPLWV
 
   IF(LSOL) THEN
 
@@ -2101,8 +2234,12 @@ MODULE POT_K
     ALLOCATE(Vdiel(SP_GRIDC%MPLWV))
     ALLOCATE(PS_TOTN(SP_GRIDC%MPLWV))
     ALLOCATE(SP_N_ION(SP_GRIDC%MPLWV))
-  
-    Vdiel = 0._q
+!$ACC ENTER DATA CREATE(SP_N,TOTN,Vdiel,PS_TOTN,SP_N_ION) __IF_ASYNC__
+
+!$ACC PARALLEL LOOP PRESENT(Vdiel) __IF_ASYNC__
+    DO I=1,NP
+       Vdiel(I) = 0._q
+    ENDDO
     Ecorr3 = 0._q
     Ecorr4 = 0._q
     Atot = 0._q
@@ -2117,7 +2254,10 @@ MODULE POT_K
 !-------------------------------------------------------------
     CALL IONIC_CHARGE (SP_GRIDC,SP_LATT_CUR,SP_P,SP_T_INFO,SP_N,1)
 
-    SP_N_ION = SP_N
+!$ACC PARALLEL LOOP PRESENT(SP_N_ION,SP_N) __IF_ASYNC__
+    DO I=1,NP
+       SP_N_ION(I) = SP_N(I)
+    ENDDO
 
 !-------------------------------------------------------------
 !total charge in fourier space
@@ -2150,7 +2290,7 @@ MODULE POT_K
 !           Compute Vcorr, the correction potential
 !           and Atot, the total solvation energy
 !
-!-------------------------------------------------------------    
+!-------------------------------------------------------------
    IF (LDEFAULTPCM) THEN
 
 #ifdef debugsol
@@ -2172,13 +2312,17 @@ MODULE POT_K
 #endif
 
 !-------------------------------------------------------------
-!JDFTx interface
+!JDFTx interface (host only: run it with offloading switched off)
 !-------------------------------------------------------------
 #ifdef jdftx
    ELSE
 
+!$ACC UPDATE SELF(TOTN,PS_TOTN) IF(OFFLOAD_ON) WAIT(ACC_ASYNC_Q)
+GPACC PUSH_OFFLOAD_ON(.FALSE.)
       CALL JDFTX_INTERFACE(SP_GRIDC, SP_LATT_CUR, TOTN, PS_TOTN, &
            & Vdiel, Vcorr, Atot)
+GPACC POP_OFFLOAD_ON
+!$ACC UPDATE DEVICE(Vdiel,Vcorr) __IF_ASYNC__
 #endif
 
    ENDIF
@@ -2186,7 +2330,7 @@ MODULE POT_K
 !
 !              END Solvation minimization
 !
-!-------------------------------------------------------------    
+!-------------------------------------------------------------
 
 #ifdef debugsol
    sol_io 'End minimization'
@@ -2198,26 +2342,18 @@ MODULE POT_K
 !-------------------------------------------------------------
 !Ecorr3 = Vcorr*n(just electrostatic correction)
 !-------------------------------------------------------------
-!test
-!   sol_io 'Vcorr(1), electrostatic corr. = ', Vcorr(1)
-!test
    CALL MY_D_PROD(Ecorr3, SP_CHTOT(1,1), Vcorr, SP_GRIDC)
-!   CALLMPI( M_sum_d(SP_GRIDC%COMM,Ecorr3,1))
-   CALLMPI( M_sum_s(SP_GRIDC%COMM,1,Ecorr3,0,0,0))
+   CALLMPI( M_sum_d(SP_GRIDC%COMM,Ecorr3,1))
 
 !-------------------------------------------------------------
-!Ecorr4 = Vdiel*n, 
+!Ecorr4 = Vdiel*n,
 !where Vdiel = epsilon and kappa2 derivative terms + cavity pot
 !-------------------------------------------------------------
-!test
-!    sol_io 'Vdiel(1), the rest = ', Vdiel(1)
-!test
    CALL MY_D_PROD(Ecorr4, SP_CHTOT(1,1), Vdiel, SP_GRIDC)
-!   CALLMPI( M_sum_d(SP_GRIDC%COMM,Ecorr4,1))
-   CALLMPI( M_sum_s(SP_GRIDC%COMM,1,Ecorr4,0,0,0))
+   CALLMPI( M_sum_d(SP_GRIDC%COMM,Ecorr4,1))
 
 !-------------------------------------------------------------
-!calculate force correction,flag=5(not used)
+!calculate force correction
 !-------------------------------------------------------------
    CALL Fcorrection(SP_GRIDC,SP_P,SP_T_INFO,SP_LATT_CUR, &
         & Vcorr,Vdiel, EIFOR_SOL)
@@ -2226,7 +2362,10 @@ MODULE POT_K
 !net correction potential
 !Vcorr = electrostatic correction + cavity correction(Vdiel)
 !-------------------------------------------------------------
-   Vcorr = Vcorr + Vdiel
+!$ACC PARALLEL LOOP PRESENT(Vcorr,Vdiel) __IF_ASYNC__
+   DO I=1,NP
+      Vcorr(I) = Vcorr(I) + Vdiel(I)
+   ENDDO
 
 #ifdef debugsol
    sol_io 'Atot, Ecorr3, Ecorr4 ', Atot, Ecorr3, Ecorr4
@@ -2246,6 +2385,7 @@ MODULE POT_K
 !-------------------------------------------------------------
    PK_COUNTER = PK_COUNTER + 1
 
+!$ACC EXIT DATA DELETE(SP_N,TOTN,Vdiel,PS_TOTN,SP_N_ION) __IF_ASYNC__
    DEALLOCATE(SP_N,TOTN)
    DEALLOCATE(Vdiel)
    DEALLOCATE(PS_TOTN)
@@ -2256,7 +2396,10 @@ MODULE POT_K
 !-------------------------------------------------------------
   ELSE
    IF (SP_IO%IU0>=0) WRITE(SP_IO%IU0, *) 'LSOL not set. No solvation for you'
-   Vcorr = 0._q
+!$ACC PARALLEL LOOP PRESENT(Vcorr) __IF_ASYNC__
+   DO I=1,NP
+      Vcorr(I) = 0._q
+   ENDDO
    Ecorr = 0._q
 
   ENDIF
@@ -2274,7 +2417,11 @@ MODULE POT_K
 !!
 !! evaluates the gaussian ionic charge(flag=1) and pseudo-core charge
 !!(flag=3)in k space
-!!also calculates force corrections(flag=5) in real space
+!!
+!! GPU version: one thread per reciprocal-lattice vector, ions are
+!! summed in the original order (type by type) inside the thread.
+!! Positions and per-type constants are copied to the device on every
+!! call, so moved ions (relaxation, MD) are always up to date.
 !!=====================================================================
 SUBROUTINE IONIC_CHARGE (SP_GRIDC,SP_LATT_CUR,SP_P,SP_T_INFO,SP_N, &
      & flag,Vcorr,Vdiel)
@@ -2292,94 +2439,118 @@ SUBROUTINE IONIC_CHARGE (SP_GRIDC,SP_LATT_CUR,SP_P,SP_T_INFO,SP_N, &
  TYPE (type_info),INTENT(IN) :: SP_T_INFO
  TYPE(potcar),INTENT(IN) :: SP_P (SP_T_INFO%NTYP)
 
- !ionic charge in k space 
+ !ionic charge in k space
  COMPLEX(q),INTENT(OUT) :: SP_N(SP_GRIDC%MPLWV)
- ! local variables   
+ ! local variables
  INTEGER,INTENT(IN) :: flag
- ! REAL(q),INTENT(IN) :: sigma_nc_k,sigma_rc_k,CORE_C
  INTEGER :: SP_NC,SP_N1,SP_N2,SP_N3,SP_NT,SP_NIS,SP_NI,SP_NG
- REAL(q) :: dx, dy,dz,dv
  REAL(q) :: SP_G1, SP_G2, SP_G3,SP_GX, SP_GY, SP_GZ, SP_GSQU
  COMPLEX(q) :: SP_CEXPF
- COMPLEX(q) :: SP_FOR_gion, SP_FOR1_gion, SP_FOR2_gion, SP_FOR3_gion
- COMPLEX(q) :: SP_FOR_cb, SP_FOR1_cb, SP_FOR2_cb, SP_FOR3_cb
- COMPLEX(q) :: imag_i
  COMPLEX(q), OPTIONAL, INTENT(IN) :: Vcorr(SP_GRIDC%MPLWV)
  COMPLEX(q), OPTIONAL, INTENT(IN) :: Vdiel(SP_GRIDC%MPLWV)
- INTEGER :: I, J
- 
- imag_i = cmplx(0._q,1._q)
+ ! locals for device code
+ INTEGER :: NIONS, NTYP, NROW, RCNP, NP
+ REAL(q) :: SNC
+ COMPLEX(q) :: ACC_N
+ REAL(q) :: B11,B12,B13,B21,B22,B23,B31,B32,B33
+ REAL(q), ALLOCATABLE :: POSL(:,:), ZVL(:), CCL(:), SRCL(:), VCAL(:)
+ INTEGER, ALLOCATABLE :: ITYPL(:)
 
- SP_N = 0._q
+ NIONS = SP_T_INFO%NIONS
+ NTYP  = SP_T_INFO%NTYP
+ NROW  = SP_GRIDC%RC%NROW
+ RCNP  = SP_GRIDC%RC%NP
+ NP    = SP_GRIDC%MPLWV
+ SNC   = sigma_nc_k
+ B11 = SP_LATT_CUR%B(1,1); B12 = SP_LATT_CUR%B(1,2); B13 = SP_LATT_CUR%B(1,3)
+ B21 = SP_LATT_CUR%B(2,1); B22 = SP_LATT_CUR%B(2,2); B23 = SP_LATT_CUR%B(2,3)
+ B31 = SP_LATT_CUR%B(3,1); B32 = SP_LATT_CUR%B(3,2); B33 = SP_LATT_CUR%B(3,3)
 
- SP_NIS = 1  
+ ALLOCATE(POSL(3,NIONS), ITYPL(NIONS))
+ ALLOCATE(ZVL(NTYP), CCL(NTYP), SRCL(NTYP), VCAL(NTYP))
 
- !-------------------------------------------------------------
- !loop over all ions
- !-------------------------------------------------------------
- type:DO SP_NT=1,SP_T_INFO%NTYP
-    ions: DO SP_NI=SP_NIS,SP_T_INFO%NITYP(SP_NT)+SP_NIS-1
-
-       SP_FOR1_gion=0._q
-       SP_FOR2_gion=0._q
-       SP_FOR3_gion=0._q
-
-       SP_FOR1_cb=0._q
-       SP_FOR2_cb=0._q
-       SP_FOR3_cb=0._q
-
-       DO SP_NG=1,SP_GRIDC%RC%NP
-          SP_N1= MOD((SP_NG-1),SP_GRIDC%RC%NROW) +1
-          SP_NC= (SP_NG-1)/SP_GRIDC%RC%NROW+1
-          SP_N2= SP_GRIDC%RC%I2(SP_NC)
-          SP_N3= SP_GRIDC%RC%I3(SP_NC)
-
-          SP_G1 = SP_T_INFO%POSION(1,SP_NI)*SP_GRIDC%LPCTX(SP_N1)
-          SP_G2 = SP_T_INFO%POSION(2,SP_NI)*SP_GRIDC%LPCTY(SP_N2)
-          SP_G3 = SP_T_INFO%POSION(3,SP_NI)*SP_GRIDC%LPCTZ(SP_N3)
-          !------------------------------------------------------
-          !phase factor
-          !------------------------------------------------------
-          SP_CEXPF=EXP(-CITPI*(SP_G3+SP_G2+SP_G1))*SP_T_INFO%VCA(SP_NT)
-          
-          SP_GX = (SP_GRIDC%LPCTX(SP_N1) * SP_LATT_CUR%B(1,1) + &
-               & SP_GRIDC%LPCTY(SP_N2) * SP_LATT_CUR%B(1,2) + &
-               & SP_GRIDC%LPCTZ(SP_N3) * SP_LATT_CUR%B(1,3))
-          SP_GY = (SP_GRIDC%LPCTX(SP_N1) * SP_LATT_CUR%B(2,1) + &
-               & SP_GRIDC%LPCTY(SP_N2) * SP_LATT_CUR%B(2,2) + &
-               & SP_GRIDC%LPCTZ(SP_N3) * SP_LATT_CUR%B(2,3))
-          SP_GZ = (SP_GRIDC%LPCTX(SP_N1) * SP_LATT_CUR%B(3,1) + &
-               & SP_GRIDC%LPCTY(SP_N2) * SP_LATT_CUR%B(3,2) + &
-               & SP_GRIDC%LPCTZ(SP_N3) * SP_LATT_CUR%B(3,3))
-          !------------------------------------------------------
-          !G**2
-          !------------------------------------------------------
-          SP_GSQU = (SP_GX*SP_GX + SP_GY*SP_GY + SP_GZ*SP_GZ) * (TPI**2)
-          !------------------------------------------------------
-          !flag=1, gaussian ionic charge
-          !------------------------------------------------------
-          IF ( flag == 1) THEN
-
-             SP_N(SP_NG) = SP_N(SP_NG) - (SP_P(SP_NT)%ZVALF) * &
-                  & SP_CEXPF*EXP(-0.5_q*SP_GSQU*(sigma_nc_k**2))
-             !-------------------------------------------------------
-             !flag=3, pseudo core charge density to repel fluid 
-             ! from core
-             !-------------------------------------------------------
-          ELSE IF ( flag == 3 ) THEN
-             
-             SP_N(SP_NG) = SP_N(SP_NG) + CORE_C(SP_NT) * SP_CEXPF * &
-                  & EXP(-0.5_q*SP_GSQU*(sigma_rc_k(SP_NT)**2))
-
-          ENDIF
-
-       ENDDO !end of loop over reciproc vectors
-
-    ENDDO ions
-    
+ SP_NIS = 1
+ DO SP_NT=1,NTYP
+    ZVL(SP_NT)  = SP_P(SP_NT)%ZVALF
+    CCL(SP_NT)  = CORE_C(SP_NT)
+    SRCL(SP_NT) = sigma_rc_k(SP_NT)
+    VCAL(SP_NT) = SP_T_INFO%VCA(SP_NT)
+    DO SP_NI=SP_NIS,SP_T_INFO%NITYP(SP_NT)+SP_NIS-1
+       ITYPL(SP_NI) = SP_NT
+       POSL(:,SP_NI) = SP_T_INFO%POSION(:,SP_NI)
+    ENDDO
     SP_NIS = SP_NIS + SP_T_INFO%NITYP(SP_NT)
+ ENDDO
+!$ACC ENTER DATA COPYIN(POSL,ITYPL,ZVL,CCL,SRCL,VCAL) __IF_ASYNC__
 
- END DO type
+!$ACC PARALLEL LOOP PRESENT(SP_N) __IF_ASYNC__
+ DO SP_NG=1,NP
+    SP_N(SP_NG) = 0._q
+ ENDDO
+
+ !-------------------------------------------------------------
+ !loop over reciprocal lattice vectors, inner loop over all ions
+ !-------------------------------------------------------------
+!$ACC PARALLEL LOOP GANG VECTOR PRESENT(SP_GRIDC,SP_N,POSL,ITYPL,ZVL,CCL,SRCL,VCAL) &
+!$ACC& PRIVATE(SP_N1,SP_NC,SP_N2,SP_N3,SP_GX,SP_GY,SP_GZ,SP_GSQU, &
+!$ACC&         SP_NI,SP_NT,SP_G1,SP_G2,SP_G3,SP_CEXPF,ACC_N) __IF_ASYNC__
+ DO SP_NG=1,RCNP
+    SP_N1= MOD((SP_NG-1),NROW) +1
+    SP_NC= (SP_NG-1)/NROW+1
+    SP_N2= SP_GRIDC%RC%I2(SP_NC)
+    SP_N3= SP_GRIDC%RC%I3(SP_NC)
+
+    SP_GX = (SP_GRIDC%LPCTX(SP_N1) * B11 + &
+         & SP_GRIDC%LPCTY(SP_N2) * B12 + &
+         & SP_GRIDC%LPCTZ(SP_N3) * B13)
+    SP_GY = (SP_GRIDC%LPCTX(SP_N1) * B21 + &
+         & SP_GRIDC%LPCTY(SP_N2) * B22 + &
+         & SP_GRIDC%LPCTZ(SP_N3) * B23)
+    SP_GZ = (SP_GRIDC%LPCTX(SP_N1) * B31 + &
+         & SP_GRIDC%LPCTY(SP_N2) * B32 + &
+         & SP_GRIDC%LPCTZ(SP_N3) * B33)
+    !------------------------------------------------------
+    !G**2
+    !------------------------------------------------------
+    SP_GSQU = (SP_GX*SP_GX + SP_GY*SP_GY + SP_GZ*SP_GZ) * (TPI**2)
+
+    ACC_N = 0._q
+!$ACC LOOP SEQ
+    DO SP_NI=1,NIONS
+       SP_NT = ITYPL(SP_NI)
+
+       SP_G1 = POSL(1,SP_NI)*SP_GRIDC%LPCTX(SP_N1)
+       SP_G2 = POSL(2,SP_NI)*SP_GRIDC%LPCTY(SP_N2)
+       SP_G3 = POSL(3,SP_NI)*SP_GRIDC%LPCTZ(SP_N3)
+       !------------------------------------------------------
+       !phase factor
+       !------------------------------------------------------
+       SP_CEXPF=EXP(-CITPI*(SP_G3+SP_G2+SP_G1))*VCAL(SP_NT)
+       !------------------------------------------------------
+       !flag=1, gaussian ionic charge
+       !------------------------------------------------------
+       IF ( flag == 1) THEN
+
+          ACC_N = ACC_N - (ZVL(SP_NT)) * &
+               & SP_CEXPF*EXP(-0.5_q*SP_GSQU*(SNC**2))
+          !-------------------------------------------------------
+          !flag=3, pseudo core charge density to repel fluid
+          ! from core
+          !-------------------------------------------------------
+       ELSE IF ( flag == 3 ) THEN
+
+          ACC_N = ACC_N + CCL(SP_NT) * SP_CEXPF * &
+               & EXP(-0.5_q*SP_GSQU*(SRCL(SP_NT)**2))
+
+       ENDIF
+    ENDDO
+    SP_N(SP_NG) = ACC_N
+
+ ENDDO !end of loop over reciproc vectors
+
+!$ACC EXIT DATA DELETE(POSL,ITYPL,ZVL,CCL,SRCL,VCAL) __IF_ASYNC__
+!$ACC WAIT(ACC_ASYNC_Q) IF(OFFLOAD_ON)
+ DEALLOCATE(POSL, ITYPL, ZVL, CCL, SRCL, VCAL)
 
  RETURN
 
@@ -2390,11 +2561,15 @@ SUBROUTINE IONIC_CHARGE (SP_GRIDC,SP_LATT_CUR,SP_P,SP_T_INFO,SP_N, &
 !!
 !!Force Correction
 !!
+!! GPU version: the (ion, reciprocal-vector) work is split into
+!! NCHUNK blocks per ion so that the GPU is filled even for few ions.
+!! Partial sums are added on the host in a fixed order, so the result
+!! is reproducible from run to run.
 !!=====================================================================
 SUBROUTINE Fcorrection(GRIDC,P,T_INFO,LATT_CUR,Vcorr,Vdiel, EIFOR_SOL)
-  USE constant 
-  USE poscar, ONLY : type_info 
-  USE lattice, ONLY : latt, DIRKAR 
+  USE constant
+  USE poscar, ONLY : type_info
+  USE lattice, ONLY : latt, DIRKAR
   USE mgrid, ONLY : grid_3d
   USE pseudo, ONLY : potcar
 
@@ -2404,140 +2579,134 @@ SUBROUTINE Fcorrection(GRIDC,P,T_INFO,LATT_CUR,Vcorr,Vdiel, EIFOR_SOL)
   TYPE (type_info)   T_INFO
   TYPE (potcar)      P (T_INFO%NTYP)
   TYPE (latt)        LATT_CUR
-  
+
   COMPLEX(q) Vcorr(GRIDC%RC%NP)
   COMPLEX(q) Vdiel(GRIDC%RC%NP)
   INTEGER :: NIS,NT,NIADD,NI,N,N1,NC,N2,N3,NG,NGP,N1P,I,J
   REAL(q) ::G,GX,GY,GZ,G1,G2,G3,FOR1,FOR2,FOR3,FOR,FACTM
   REAL(q) :: EIFOR_SOL(3,T_INFO%NIONS)
   COMPLEX(q) :: CE,CX,CEXPF
+  ! locals for device code
+  INTEGER, PARAMETER :: NCHUNK = 64
+  INTEGER :: NIONS, NTYP, NROW, RCNP, ICH, ICHUNK, NG1, NG2
+  REAL(q) :: SNC, GWORK, PCWORK
+  REAL(q) :: B11,B12,B13,B21,B22,B23,B31,B32,B33
+  REAL(q), ALLOCATABLE :: POSL(:,:), ZVL(:), CCL(:), SRCL(:), VCAL(:)
+  REAL(q), ALLOCATABLE :: FPART(:,:,:)
+  INTEGER, ALLOCATABLE :: ITYPL(:)
 
-  REAL(q), ALLOCATABLE :: GWORK(:),PCWORK(:)
-   
-  ALLOCATE(GWORK(GRIDC%RC%NP),PCWORK(GRIDC%RC%NP))
+  NIONS = T_INFO%NIONS
+  NTYP  = T_INFO%NTYP
+  NROW  = GRIDC%RC%NROW
+  RCNP  = GRIDC%RC%NP
+  ICHUNK = (RCNP + NCHUNK - 1) / NCHUNK
+  SNC   = sigma_nc_k
+  B11 = LATT_CUR%B(1,1); B12 = LATT_CUR%B(1,2); B13 = LATT_CUR%B(1,3)
+  B21 = LATT_CUR%B(2,1); B22 = LATT_CUR%B(2,2); B23 = LATT_CUR%B(2,3)
+  B31 = LATT_CUR%B(3,1); B32 = LATT_CUR%B(3,2); B33 = LATT_CUR%B(3,3)
+
+  ALLOCATE(POSL(3,NIONS), ITYPL(NIONS))
+  ALLOCATE(ZVL(NTYP), CCL(NTYP), SRCL(NTYP), VCAL(NTYP))
+  ALLOCATE(FPART(3,NCHUNK,NIONS))
 
   NIS=1
+  DO NT=1,NTYP
+     ZVL(NT)  = P(NT)%ZVALF
+     CCL(NT)  = CORE_C(NT)
+     SRCL(NT) = sigma_rc_k(NT)
+     VCAL(NT) = T_INFO%VCA(NT)
+     DO NI=NIS,T_INFO%NITYP(NT)+NIS-1
+        ITYPL(NI) = NT
+        POSL(:,NI) = T_INFO%POSION(:,NI)
+     ENDDO
+     NIS=NIS+T_INFO%NITYP(NT)
+  ENDDO
+!$ACC ENTER DATA COPYIN(POSL,ITYPL,ZVL,CCL,SRCL,VCAL) CREATE(FPART) __IF_ASYNC__
 
-  typ: DO NT=1,T_INFO%NTYP
-     
-     NIADD=T_INFO%NITYP(NT)
-
-     DO N=1,GRIDC%RC%NP
-        N1= MOD((N-1),GRIDC%RC%NROW) +1
-        NC= (N-1)/GRIDC%RC%NROW+1
+  !-------------------------------------------------------------
+  ! partial force on ion NI from reciprocal vectors of block ICH:
+  !   GWORK  = -Z_val * exp(-G^2 sigma_nc^2 / 2)
+  !   PCWORK =  C_core * exp(-G^2 sigma_rc^2 / 2)
+  !   FOR    = GWORK  * Im(conj(Vcorr) * exp(-i G.R))
+  !          + PCWORK * Im(conj(Vdiel) * exp(-i G.R))
+  !   FOR_k  = FOR_k - G_k(index) * FOR
+  !-------------------------------------------------------------
+!$ACC PARALLEL LOOP GANG COLLAPSE(2) PRESENT(GRIDC,Vcorr,Vdiel,POSL,ITYPL,ZVL,CCL, &
+!$ACC& SRCL,VCAL,FPART) PRIVATE(NT,NG1,NG2,FOR1,FOR2,FOR3) __IF_ASYNC__
+  DO NI=1,NIONS
+  DO ICH=1,NCHUNK
+     NT  = ITYPL(NI)
+     NG1 = (ICH-1)*ICHUNK + 1
+     NG2 = MIN(ICH*ICHUNK, RCNP)
+     FOR1=0
+     FOR2=0
+     FOR3=0
+!$ACC LOOP VECTOR REDUCTION(+:FOR1,FOR2,FOR3) &
+!$ACC& PRIVATE(N1,NC,N2,N3,FACTM,GX,GY,GZ,G,G1,G2,G3,CEXPF,FOR,GWORK,PCWORK)
+     DO NG=NG1,NG2
+        N1= MOD((NG-1),NROW) +1
+        NC= (NG-1)/NROW+1
         N2= GRIDC%RC%I2(NC)
         N3= GRIDC%RC%I3(NC)
-         
+
         SETFACT1
         SETFACT
-        
-        GX = GRIDC%LPCTX(N1)*LATT_CUR%B(1,1)+GRIDC%LPCTY(N2)*&
-             & LATT_CUR%B(1,2)+GRIDC%LPCTZ(N3)*LATT_CUR%B(1,3)
-        GY = GRIDC%LPCTX(N1)*LATT_CUR%B(2,1)+GRIDC%LPCTY(N2)*&
-             & LATT_CUR%B(2,2)+GRIDC%LPCTZ(N3)*LATT_CUR%B(2,3)
-        GZ = GRIDC%LPCTX(N1)*LATT_CUR%B(3,1)+GRIDC%LPCTY(N2)*&
-             & LATT_CUR%B(3,2)+GRIDC%LPCTZ(N3)*LATT_CUR%B(3,3)
+
+        GX = GRIDC%LPCTX(N1)*B11+GRIDC%LPCTY(N2)*B12+GRIDC%LPCTZ(N3)*B13
+        GY = GRIDC%LPCTX(N1)*B21+GRIDC%LPCTY(N2)*B22+GRIDC%LPCTZ(N3)*B23
+        GZ = GRIDC%LPCTX(N1)*B31+GRIDC%LPCTY(N2)*B32+GRIDC%LPCTZ(N3)*B33
 
         G=SQRT(GX**2+GY**2+GZ**2)*TPI
 
-        GWORK (N) = -(P(NT)%ZVALF)*EXP(-0.5_q*(G**2)*(sigma_nc_k**2))
-        PCWORK (N) = (CORE_C(NT))*EXP(-0.5_q*(G**2)*(sigma_rc_k(NT)**2))
+        GWORK  = -(ZVL(NT))*EXP(-0.5_q*(G**2)*(SNC**2))
+        PCWORK = (CCL(NT))*EXP(-0.5_q*(G**2)*(SRCL(NT)**2))
 
+        G1=POSL(1,NI)*GRIDC%LPCTX(N1)
+        G2=POSL(2,NI)*GRIDC%LPCTY(N2)
+        G3=POSL(3,NI)*GRIDC%LPCTZ(N3)
+        CEXPF=EXP(-CITPI*(G3+G2+G1))*VCAL(NT)
+
+        FOR = GWORK*MULFACT AIMAG(CONJG(Vcorr(NG))*CEXPF)
+        FOR = FOR + PCWORK*MULFACT AIMAG(CONJG(Vdiel(NG))*CEXPF)
+        FOR1=FOR1-GRIDC%LPCTX_(N1)*FOR
+        FOR2=FOR2-GRIDC%LPCTY_(N2)*FOR
+        FOR3=FOR3-GRIDC%LPCTZ_(N3)*FOR
      ENDDO
+     FPART(1,ICH,NI)=FOR1
+     FPART(2,ICH,NI)=FOR2
+     FPART(3,ICH,NI)=FOR3
+  ENDDO
+  ENDDO
 
-     ion: DO NI=NIS,NIADD+NIS-1
-        !-------------------------------------------------------------
-        ! initialise the force on the ion to zero
-        !-------------------------------------------------------------
-        FOR1=0
-        FOR2=0
-        FOR3=0
+!$ACC UPDATE SELF(FPART) IF(OFFLOAD_ON) WAIT(ACC_ASYNC_Q)
+!$ACC EXIT DATA DELETE(POSL,ITYPL,ZVL,CCL,SRCL,VCAL,FPART) __IF_ASYNC__
+!$ACC WAIT(ACC_ASYNC_Q) IF(OFFLOAD_ON)
 
-        !-------------------------------------------------------------
-        !CGXDX,Y,Z = I* the changes in the phase factor g.r on 
-        !moving one reciprocal lattice vector in the x,y,z 
-        !directions, respectively
-        !-------------------------------------------------------------
+  !---------------------------------------------------------
+  ! sum the blocks and multiply forces by 2*Pi
+  !----------------------------------------------------------
+  DO NI=1,NIONS
+     FOR1=0
+     FOR2=0
+     FOR3=0
+     DO ICH=1,NCHUNK
+        FOR1=FOR1+FPART(1,ICH,NI)
+        FOR2=FOR2+FPART(2,ICH,NI)
+        FOR3=FOR3+FPART(3,ICH,NI)
+     ENDDO
+     EIFOR_SOL(1,NI)=FOR1*TPI
+     EIFOR_SOL(2,NI)=FOR2*TPI
+     EIFOR_SOL(3,NI)=FOR3*TPI
+  ENDDO
 
-        !-------------------------------------------------------------
-        ! calculate the total force on the ions by summing over 
-        !reciprocal lattice vectors
-        ! first calculate phase factor:
-        ! there are two version for calculating the phase factor
-        ! on vector machines you might try the first version
-        ! (see stufak.F)
-        !-------------------------------------------------------------
-#ifdef vector
-        DO NG=1,GRIDC%RC%NP
-           N1= MOD((NG-1),GRIDC%RC%NROW) +1
-           NC= (NG-1)/GRIDC%RC%NROW+1
-           N2= GRIDC%RC%I2(NC)
-           N3= GRIDC%RC%I3(NC)
-
-           G1=T_INFO%POSION(1,NI)*GRIDC%LPCTX(N1)
-           G2=T_INFO%POSION(2,NI)*GRIDC%LPCTY(N2)
-           G3=T_INFO%POSION(3,NI)*GRIDC%LPCTZ(N3)
-           SETFACT1
-           SETFACT
-           CEXPF=EXP(-CITPI*(G3+G2+G1))*T_INFO%VCA(NT)
-#else
-           CX =EXP(-CITPI*T_INFO%POSION(1,NI))
-           G1 =T_INFO%POSION(1,NI)*xmin(GRIDC%NGX)
-
-           DO NC=1,GRIDC%RC%NCOL
-              NGP=(NC-1)*GRIDC%RC%NROW+1
-
-              N2= GRIDC%RC%I2(NC)
-              N3= GRIDC%RC%I3(NC)
-              G2=T_INFO%POSION(2,NI)*GRIDC%LPCTY(N2)
-              G3=T_INFO%POSION(3,NI)*GRIDC%LPCTZ(N3)
-              CE=EXP(-CITPI*(G3+G2+G1))*T_INFO%VCA(NT)
-
-              DO N1P=0,GRIDC%RC%NROW-1
-                 SETN1fromN1P
-                 NG=NGP+N1
-                 N1=N1+1
-                  
-                 SETFACT1
-                 SETFACT
-                 CEXPF=CE
-                 CE=CE*CX
-#endif
-
-                 !---------------------------------------------------
-                 ! add the contribution to the force from the present
-                 !  reciprocal lattice
-                 ! vector  and multiply by i (ie take imaginary part)
-                 !---------------------------------------------------
-                 FOR = GWORK(NG)*MULFACT AIMAG(CONJG(Vcorr(NG))*CEXPF)
-                 FOR = FOR + PCWORK(NG)*MULFACT AIMAG(CONJG(Vdiel(NG))*CEXPF)
-                 FOR1=FOR1-GRIDC%LPCTX_(N1)*FOR
-                 FOR2=FOR2-GRIDC%LPCTY_(N2)*FOR
-                 FOR3=FOR3-GRIDC%LPCTZ_(N3)*FOR
-              ENDDO
-#ifndef vector
-           ENDDO
-#endif
-
-           !---------------------------------------------------------
-           ! multiply forces by 2*Pi
-           !----------------------------------------------------------
-           EIFOR_SOL(1,NI)=FOR1*TPI
-           EIFOR_SOL(2,NI)=FOR2*TPI
-           EIFOR_SOL(3,NI)=FOR3*TPI
-           
-        ENDDO ion
-        NIS=NIS+NIADD
-     ENDDO typ
+  DEALLOCATE(POSL, ITYPL, ZVL, CCL, SRCL, VCAL, FPART)
      !----------------------------------------------------------------
      ! forces are now in the reciprocal lattice transform it to
      ! cartesian coordinates
      !----------------------------------------------------------------
      CALLMPI( M_sum_d(GRIDC%COMM, EIFOR_SOL(1,1),T_INFO%NIONS*3))
-     
-     CALL  DIRKAR(T_INFO%NIONS,EIFOR_SOL,LATT_CUR%B)
 
-     DEALLOCATE(GWORK,PCWORK)
+     CALL  DIRKAR(T_INFO%NIONS,EIFOR_SOL,LATT_CUR%B)
 
 #ifdef debugsol
      sol_io 'FORCE CORRECTIONS'
@@ -2713,8 +2882,8 @@ END SUBROUTINE JDFTX_INTERFACE
 !!=====================================================================
 SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
 
-  USE poscar, ONLY : type_info 
-  USE lattice, ONLY : latt, DIRKAR 
+  USE poscar, ONLY : type_info
+  USE lattice, ONLY : latt, DIRKAR
   USE mgrid, ONLY : grid_3d
   USE pseudo, ONLY : potcar
   USE wave, ONLY : wavedes
@@ -2725,29 +2894,40 @@ SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
   TYPE (latt),INTENT(IN) :: LATT_CUR
   TYPE (grid_3d) :: GRIDC
   TYPE (wavedes) :: WDES
-   
+
   INTEGER(q) :: I
   COMPLEX(q) :: CVPSP(GRIDC%MPLWV,WDES%NCDIJ)
   COMPLEX(q) :: CHTOT(GRIDC%MPLWV, WDES%NCDIJ)
 
   RGRID, ALLOCATABLE :: RCHTOT(:), RV(:)
-  COMPLEX(q), ALLOCATABLE::  CWORK(:), CWORK_V(:), CVHAR(:), CV(:) 
+  COMPLEX(q), ALLOCATABLE::  CWORK(:), CWORK_V(:), CVHAR(:), CV(:)
   REAL(q) :: VACPOT_PSP, VACPOT
 
   INTEGER :: NODE_ME, IONODE
+  INTEGER(q) :: NP, NPR
+
+  NP  = GRIDC%MPLWV
+  NPR = DIMREAL(GRIDC%MPLWV)
 
   ALLOCATE(CWORK(GRIDC%MPLWV), CWORK_V(GRIDC%MPLWV) )
   ALLOCATE(CVHAR(GRIDC%MPLWV), CV(GRIDC%MPLWV))
   ALLOCATE(RCHTOT(DIMREAL(GRIDC%MPLWV)), RV(DIMREAL(GRIDC%MPLWV)))
+!$ACC ENTER DATA CREATE(CWORK,CWORK_V,CVHAR,CV,RCHTOT,RV) __IF_ASYNC__
 
-  CWORK = 0._q
-  CWORK_V = 0._q
-  CVHAR = 0._q
-  CV = 0._q
-  RV = 0._q
-  RCHTOT = 0._q
+!$ACC PARALLEL LOOP PRESENT(CWORK,CWORK_V,CVHAR,CV) __IF_ASYNC__
+  DO I=1,NP
+     CWORK(I) = 0._q
+     CWORK_V(I) = 0._q
+     CVHAR(I) = 0._q
+     CV(I) = 0._q
+  ENDDO
+!$ACC PARALLEL LOOP PRESENT(RV,RCHTOT) __IF_ASYNC__
+  DO I=1,NPR
+     RV(I) = 0._q
+     RCHTOT(I) = 0._q
+  ENDDO
 
-  !copy CHTOT to CWORK                                         
+  !copy CHTOT to CWORK
   CALL RC_ADD(CHTOT, 1.0_q, CHTOT, 0.0_q, CWORK, GRIDC)
   !hartree pot, CVHAR from CHTOT
   CALL SimplePoisson(GRIDC, LATT_CUR, CWORK, CVHAR, 1)
@@ -2760,8 +2940,14 @@ SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
   CALL WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, 'PHI_HAR', RV)
 #endif
 
-  CV = 0._q
-  RV = 0._q
+!$ACC PARALLEL LOOP PRESENT(CV) __IF_ASYNC__
+  DO I=1,NP
+     CV(I) = 0._q
+  ENDDO
+!$ACC PARALLEL LOOP PRESENT(RV) __IF_ASYNC__
+  DO I=1,NPR
+     RV(I) = 0._q
+  ENDDO
   ! CVPSP --> real
   CALL RC_ADD(CVPSP, 1.0_q, CVPSP, 0.0_q, CV, GRIDC)
   CALL FFT3D(CV, GRIDC, 1)
@@ -2771,8 +2957,14 @@ SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
   CALL WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, 'PHI_PSP', RV)
 #endif
 
-  CV = 0._q
-  RV = 0._q
+!$ACC PARALLEL LOOP PRESENT(CV) __IF_ASYNC__
+  DO I=1,NP
+     CV(I) = 0._q
+  ENDDO
+!$ACC PARALLEL LOOP PRESENT(RV) __IF_ASYNC__
+  DO I=1,NPR
+     RV(I) = 0._q
+  ENDDO
   ! CVPSP + CVHAR --> real
   CALL RC_ADD(CVPSP, 1.0_q, CVHAR, 1.0_q, CV, GRIDC)
   CALL FFT3D(CV, GRIDC, 1)
@@ -2786,7 +2978,7 @@ SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
   CALL FFT3D(CWORK, GRIDC, 1)
   CALL UNPACK_C2R(CWORK, 1.0_q, CWORK, 0.0_q, RCHTOT, GRIDC)
 
-  ! vacuum level
+  ! vacuum level (GET_VAC_LEVEL copies RCHTOT and RV to the host itself)
   CALL GET_VAC_LEVEL(GRIDC, RCHTOT, RV, VACPOT_PSP)
 #ifdef debugsol
   IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) 'VACPOT_PSP = ', VACPOT_PSP
@@ -2794,16 +2986,17 @@ SUBROUTINE GET_FERMISHIFT(LATT_CUR, T_INFO, GRIDC, WDES, CVPSP, CHTOT)
   VACPOT = VACPOT_POIS - VACPOT_PSP
   IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) ' FERMI_SHIFT = ', VACPOT
 !#ifdef debugsolwf
-!  !shift by vacpot                                                
+!  !shift by vacpot
 !  RV = RV + VACPOT
 !  IF (SP_IO%IU0>=0)  WRITE(SP_IO%IU0,*) 'Writing PHI_PSP_HAR (shifted by VACPOT)'
 !  CALL WRITE_TO_FILE(GRIDC, LATT_CUR, T_INFO, 'PHI_PSP_HAR_SHIFTED', RV)
 !#endif
 
+!$ACC EXIT DATA DELETE(CWORK,CWORK_V,CVHAR,CV,RCHTOT,RV) __IF_ASYNC__
   DEALLOCATE(RCHTOT, RV)
   DEALLOCATE(CWORK_V, CWORK, CVHAR, CV)
 
-  RETURN 
+  RETURN
 
 END SUBROUTINE GET_FERMISHIFT
 ! vaclevel
@@ -2822,6 +3015,7 @@ MODULE solvation
   USE prec
   USE base
   USE pot_k
+GPACC USE moffload_struct_def, ONLY : OFFLOAD_ON, ACC_ASYNC_Q
 
   IMPLICIT NONE
 
@@ -3230,14 +3424,16 @@ CONTAINS
     IF (.NOT.LSOL) RETURN
 
     ALLOCATE(Vcorr(GRIDC%MPLWV))
-    
+!$ACC ENTER DATA CREATE(Vcorr) __IF_ASYNC__
+
     CALL SOL_INIT(IO_1, EDIFF_1, INFO, LATT_CUR, GRIDC, T_INFO, P, &
       & sigma_k, nc_k, eb_k, tau, lambda_d_k, kappa2b_k, &
       & EDIFFSOL, LRHOB, LRHOION)
-         
-    CALL VCORRECTION(GRIDC, P, LATT_CUR, T_INFO, WDES, &
-         & CHTOT, Vcorr, Ecorr, EIFOR_SOL) 
 
+    CALL VCORRECTION(GRIDC, P, LATT_CUR, T_INFO, WDES, &
+         & CHTOT, Vcorr, Ecorr, EIFOR_SOL)
+
+!$ACC PARALLEL LOOP PRESENT(CVTOT,Vcorr) __IF_ASYNC__
     DO I = 1, GRIDC%RC%NP
        CVTOT(I,1) = CVTOT(I,1) + Vcorr(I)
     ENDDO
@@ -3261,6 +3457,7 @@ CONTAINS
 
     ENDIF
 
+!$ACC EXIT DATA DELETE(Vcorr) __IF_ASYNC__
     DEALLOCATE(Vcorr)
       
     RETURN

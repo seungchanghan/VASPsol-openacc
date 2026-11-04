@@ -1,4 +1,55 @@
-[![vaspsol](docs/logo.jpeg)](http://vaspsol.mse.ufl.edu/)
+<img src="docs/vaspsol-openacc.png" alt="VASPsol + OpenACC" width="400">
+
+# VASPsol-openacc
+
+Unofficial, experimental OpenACC (NVIDIA GPU) port of
+[VASPsol](https://github.com/henniggroup/VASPsol), the implicit solvation
+model for VASP by K. Mathew and R. G. Hennig. This fork is not affiliated
+with or endorsed by the original authors. The original README follows below.
+
+## What changed
+
+- `src/solvation.F` offloads the solvation grid work (cavity and dielectric
+  function, generalized Poisson conjugate-gradient solver, dielectric and
+  cavitation potentials, ionic force correction, RHOB/RHOION output) to the
+  GPU with OpenACC. Work arrays stay on the device; only scalar reductions,
+  the vacuum-level search and file output are copied to the host.
+- In CPU builds every directive is inactive and the original VASPsol code
+  path is used.
+- Global sums use `M_sum_d` (VASP >= 6.4.2), so no `mpi.F` patch is needed.
+- GPU builds call the Fortran intrinsic `ERFC` instead of `ERRFC`. Parallel
+  reductions change the summation order, so GPU and CPU results can differ
+  at round-off level.
+
+## Scope
+
+- Developed for VASP 6.5.1 GPU builds with the NVIDIA HPC SDK
+  (`-DACC_OFFLOAD`).
+- OpenMP-offload builds (AMD/Intel GPUs) are not supported.
+- The optional JDFTx interface (`-Djdftx`) runs on the host.
+
+## Installation
+
+1. Copy `src/solvation.F` into the `src/` directory of VASP.
+2. Keep `-Dsol_compat` in `CPP_OPTIONS` of `makefile.include`.
+3. Add the VASP-side hooks that VASPsol needs for your VASP version (see the
+   original instructions below) and rebuild VASP.
+
+## Status
+
+Experimental. Compare against a CPU build of the original VASPsol before
+using it for production calculations.
+
+## Citation and license
+
+Please cite the original VASPsol papers listed below. The code is licensed
+under the Apache License 2.0 (see `LICENSE.rst`); the modifications are
+marked at the top of `src/solvation.F`.
+
+---
+
+# Original VASPsol README
+
 
 New VASPsol ++  All new development will be in VASPsol ++ https://github.com/VASPsol/VASPsol/
 ===============
